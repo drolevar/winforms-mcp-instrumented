@@ -249,3 +249,37 @@ Local `dotnet pack` output is a review artifact. Publishing to NuGet, creating a
 remote repository, and tagging a release are separate actions; none is implied by
 creating this draft. Third-party packages retain their own licenses.
 
+### Trusted publishing to nuget.org
+
+`.github/workflows/publish.yml` publishes without a stored API key. NuGet
+[trusted publishing](https://learn.microsoft.com/en-us/nuget/nuget-org/trusted-publishing)
+lets the workflow exchange GitHub's OIDC token for a short-lived nuget.org key
+(`NuGet/login`). There is no long-lived secret to leak or rotate; the only stored
+value, `NUGET_USER`, is a public profile name.
+
+Why it is shaped this way:
+
+- **Tag-triggered only.** Package IDs and versions are permanent on nuget.org, so
+  nothing publishes from a branch or pull request. A `v*` tag is the deliberate act.
+- **It reuses `eng/build.ps1`.** The tests, stripping checks, packing and
+  packed-package restore that gate a developer build gate the release too; a
+  failure publishes nothing. There is no second, unverified packing path.
+- **The tag is the version.** MinVer derives it, so the workflow checks out full
+  history and verifies that all three packages carry the tag's version.
+- **The tag must be on `main`.** A tag on an unreviewed branch commit cannot publish.
+- **A `release` environment** holds `NUGET_USER` and can require a reviewer's
+  approval before the job runs.
+
+One-time setup (the repository owner does this; nothing in the repository can):
+
+| Where | What |
+| --- | --- |
+| nuget.org → Trusted Publishing → Create | Owner: the publishing account. GitHub Actions; repository owner/name of this repository; workflow file `publish.yml`; environment `release`. Scope **Push** only (not unlist, not stage); initially "new packages and versions", then "only new versions" once all three IDs exist |
+| Same form, package patterns | The exact IDs `WinFormsMcp.Instrumented`, `WinFormsMcp.Instrumented.Protocol`, `WinFormsMcp.Instrumented.Server`, one per line. Exact IDs rather than `WinFormsMcp.Instrumented*` so a compromised workflow cannot create or update any other package |
+| GitHub → Settings → Environments | `release`, secret `NUGET_USER` = nuget.org profile name (not an e-mail); required reviewers recommended |
+
+The policy matches the workflow filename and environment name exactly; a mismatch
+fails as "no matching policy". The first release creates the package IDs for good,
+so check them first: no `PackageId` is set, so they default to the project names.
+To release, push a tag such as `v0.1.0-alpha.1`.
+

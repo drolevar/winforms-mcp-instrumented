@@ -1,0 +1,69 @@
+name: Publish to NuGet
+
+# Publishing is a deliberate act: it runs only for a version tag (for example v0.1.0-alpha.1)
+# and, through the `release` environment, can require a human approval. NuGet package IDs and
+# versions are permanent, so nothing here runs on branches or pull requests.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions: {}
+
+jobs:
+  publish:
+    runs-on: windows-latest
+    # The nuget.org trusted-publishing policy names this environment, and NUGET_USER lives in it.
+    environment: release
+    permissions:
+      id-token: write   # Required: lets NuGet/login exchange the GitHub OIDC token for a short-lived API key
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # MinVer derives the package version from the tag and history
+
+      - name: Require the tagged commit to be on main
+        shell: bash
+        run: |
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Tag $GITHUB_REF_NAME does not point at a commit on main."
+            exit 1
+          fi
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+
+      # The same workflow developers run locally: all tests, stripping checks, packing, and a
+      # restore of the freshly packed packages. A failure here publishes nothing.
+      - name: Build, test, verify and pack
+        shell: pwsh
+        run: ./eng/build.ps1
+
+      - name: Check package versions match the tag
+        shell: pwsh
+        run: |
+          $expected = $env:GITHUB_REF_NAME.TrimStart('v')
+          $packages = @(Get-ChildItem artifacts/packages -Filter '*.nupkg' -File)
+          if ($packages.Count -ne 3) { throw "Expected 3 packages, found $($packages.Count)." }
+          foreach ($package in $packages) {
+              if (-not $package.Name.EndsWith(".$expected.nupkg", [StringComparison]::Ordinal)) {
+                  throw "$($package.Name) does not carry version $expected from tag $env:GITHUB_REF_NAME."
+              }
+          }
+
+      - name: NuGet login (OIDC)
+        id: login
+        uses: NuGet/login@v1
+        with:
+          user: ${{ secrets.NUGET_USER }}  # nuget.org profile name, not an e-mail address
+
+      - name: Push to nuget.org
+        shell: pwsh
+        run: >-
+          dotnet nuget push "artifacts/packages/*.nupkg"
+          --api-key "${{ steps.login.outputs.NUGET_API_KEY }}"
+          --source https://api.nuget.org/v3/index.json
+          --skip-duplicate
