@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "WinFormsMcp_Instrumented",
+  "project_id": "0cd35738-fc1e-409f-aa8b-7f69dfb5ca23"
+}
