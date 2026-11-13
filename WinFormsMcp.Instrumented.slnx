@@ -1,0 +1,40 @@
+<Solution>
+  <Folder Name="/Solution Items/">
+    <File Path="AGENTS.md" />
+    <File Path="CLAUDE.md" />
+    <File Path="Directory.Build.props" />
+    <File Path="Directory.Build.targets" />
+    <File Path="Directory.Packages.props" />
+    <File Path="global.json" />
+    <File Path="LICENSE" />
+    <File Path="README.md" />
+  </Folder>
+  <Folder Name="/docs/">
+    <File Path="docs/00-overview.md" />
+    <File Path="docs/01-purpose-and-principles.md" />
+    <File Path="docs/02-architecture.md" />
+    <File Path="docs/03-bridge-protocol.md" />
+    <File Path="docs/04-controls-and-capture.md" />
+    <File Path="docs/05-integration-and-stripping.md" />
+    <File Path="docs/06-build-and-distribution.md" />
+    <File Path="docs/07-implementation-status.md" />
+    <File Path="docs/08-mcp-tools.md" />
+  </Folder>
+  <Folder Name="/docs/adr/">
+    <File Path="docs/adr/0001-sidecar-and-in-process-bridge.md" />
+    <File Path="docs/adr/0002-build-time-exclusion.md" />
+    <File Path="docs/adr/0003-versioning-and-packaging.md" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/WinFormsMcp.Instrumented.Protocol/WinFormsMcp.Instrumented.Protocol.csproj" />
+    <Project Path="src/WinFormsMcp.Instrumented/WinFormsMcp.Instrumented.csproj" />
+    <Project Path="src/WinFormsMcp.Instrumented.Server/WinFormsMcp.Instrumented.Server.csproj" />
+  </Folder>
+  <Folder Name="/samples/">
+    <Project Path="samples/InstrumentedDemo/InstrumentedDemo.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/WinFormsMcp.Instrumented.Protocol.Tests/WinFormsMcp.Instrumented.Protocol.Tests.csproj" />
+    <Project Path="tests/WinFormsMcp.Instrumented.Tests/WinFormsMcp.Instrumented.Tests.csproj" />
+  </Folder>
+</Solution>

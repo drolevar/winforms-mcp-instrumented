@@ -1,0 +1,50 @@
+name: Build and validate
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Build, test, verify stripped output, and pack
+        shell: pwsh
+        run: ./eng/build.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: artifacts/packages/*.nupkg
+          if-no-files-found: error
+  portable-protocol:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Test portable framing and contracts
+        run: >-
+          dotnet test tests/WinFormsMcp.Instrumented.Protocol.Tests/WinFormsMcp.Instrumented.Protocol.Tests.csproj
+          -c Release --artifacts-path artifacts/portable
+      - name: Build independent MCP server
+        run: >-
+          dotnet build src/WinFormsMcp.Instrumented.Server/WinFormsMcp.Instrumented.Server.csproj
+          -c Release --artifacts-path artifacts/mcp
+      - name: Verify MCP tools while the application is offline
+        run: >-
+          python3 eng/smoke-mcp.py -- dotnet
+          artifacts/mcp/bin/WinFormsMcp.Instrumented.Server/release/WinFormsMcp.Instrumented.Server.dll
+          --app "$RUNNER_TEMP/not-started/InstrumentedDemo.exe"

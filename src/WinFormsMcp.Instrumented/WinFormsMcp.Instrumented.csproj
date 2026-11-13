@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <Description>In-process WinForms inspection and automation bridge for .NET Framework 4.8.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../WinFormsMcp.Instrumented.Protocol/WinFormsMcp.Instrumented.Protocol.csproj" />
+  </ItemGroup>
+</Project>

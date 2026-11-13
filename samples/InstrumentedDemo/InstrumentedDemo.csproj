@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <IsPackable>false</IsPackable>
+    <IsInstrumentationConsumer>true</IsInstrumentationConsumer>
+    <AutoGenerateBindingRedirects>true</AutoGenerateBindingRedirects>
+    <GenerateBindingRedirectsOutputType>true</GenerateBindingRedirectsOutputType>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <EnableWinFormsMcpInstrumentation
+      Condition="'$(EnableWinFormsMcpInstrumentation)' == '' and '$(Configuration)' == 'Debug'">true</EnableWinFormsMcpInstrumentation>
+    <EnableWinFormsMcpInstrumentation
+      Condition="'$(EnableWinFormsMcpInstrumentation)' == ''">false</EnableWinFormsMcpInstrumentation>
+    <DefineConstants
+      Condition="'$(EnableWinFormsMcpInstrumentation)' == 'true'">$(DefineConstants);WINFORMS_MCP_INSTRUMENTED</DefineConstants>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(EnableWinFormsMcpInstrumentation)' == 'true'">
+    <ProjectReference Include="../../src/WinFormsMcp.Instrumented/WinFormsMcp.Instrumented.csproj" />
+  </ItemGroup>
+</Project>
