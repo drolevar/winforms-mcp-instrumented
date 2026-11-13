@@ -15,7 +15,7 @@ namespace WinFormsMcp.Instrumented.Tests
     /// <summary>Real named-pipe tests against a dedicated STA WinForms message loop.</summary>
     /// <remarks>Requires Windows and .NET Framework 4.8; these are not portable UI tests.</remarks>
     [TestClass]
-    public sealed class BridgeIntegrationTests
+    public sealed partial class BridgeIntegrationTests
     {
         [TestMethod]
         public async Task AControlCreatedAfterStartupAppearsWithoutRegistration()
@@ -233,12 +233,19 @@ namespace WinFormsMcp.Instrumented.Tests
             internal Panel RightPanel { get; private set; } = null!;
             internal Button ReparentedChild { get; private set; } = null!;
             internal TabControl Tabs { get; private set; } = null!;
+            internal Button DoomedButton { get; private set; } = null!;
+            internal int DoomedClicks => Volatile.Read(ref doomedClicks);
+            private int doomedClicks;
 
             private void Run()
             {
                 try
                 {
-                    using (McpBridge.Start(options => options.UiRequestTimeout = TimeSpan.FromSeconds(3)))
+                    using (McpBridge.Start(options =>
+                    {
+                        options.UiRequestTimeout = TimeSpan.FromSeconds(3);
+                        options.Exclude(control => control.Name == "Excluded");
+                    }))
                     using (var window = new Form { Name = "TestWindow", Text = "WinForms MCP tests", Width = 500, Height = 400 })
                     {
                         Window = window;
@@ -272,6 +279,29 @@ namespace WinFormsMcp.Instrumented.Tests
                         Tabs.TabPages.Add(firstPage);
                         Tabs.TabPages.Add(secondPage);
                         window.Controls.Add(Tabs);
+
+                        // Fixtures for validation, paging, redaction, exclusion and race tests.
+                        window.Controls.Add(new Button { Name = "DisabledButton", Text = "Disabled", Enabled = false, Top = 110 });
+                        window.Controls.Add(new Button { Name = "HiddenButton", Text = "Hidden", Visible = false, Top = 110, Left = 80 });
+                        window.Controls.Add(new TextBox { Name = "ReadOnlyText", Text = "fixed", ReadOnly = true, Top = 140 });
+                        window.Controls.Add(new TextBox { Name = "Password", Text = "secret", UseSystemPasswordChar = true, Top = 140, Left = 110 });
+                        window.Controls.Add(new TextBox { Name = "FreeText", Top = 140, Left = 220 });
+                        window.Controls.Add(new NumericUpDown { Name = "Number", Minimum = 0, Maximum = 10, Value = 5, Top = 170 });
+                        window.Controls.Add(new Label { Name = "PlainLabel", Text = "label", Top = 170, Left = 110 });
+                        DoomedButton = new Button { Name = "Doomed", Text = "Doomed", Top = 170, Left = 200 };
+                        DoomedButton.Click += (_, __) => Interlocked.Increment(ref doomedClicks);
+                        window.Controls.Add(DoomedButton);
+                        var bigList = new ListBox { Name = "BigList", Top = 200, Left = 380, Width = 100, Height = 80 };
+                        for (int i = 0; i < 250; i++) bigList.Items.Add("Item " + i);
+                        window.Controls.Add(bigList);
+                        var bigGrid = new DataGridView { Name = "BigGrid", AllowUserToAddRows = false, Top = 290, Left = 380, Width = 100, Height = 80 };
+                        bigGrid.Columns.Add("a", "A");
+                        bigGrid.Columns.Add("b", "B");
+                        for (int i = 0; i < 250; i++) bigGrid.Rows.Add("a" + i, "b" + i);
+                        window.Controls.Add(bigGrid);
+                        var excluded = new Panel { Name = "Excluded", Top = 290, Left = 0, Width = 100, Height = 50 };
+                        excluded.Controls.Add(new TextBox { Name = "InsideExcluded" });
+                        window.Controls.Add(excluded);
                         window.Shown += (_, __) => ready.Set();
                         Application.Run(window);
                     }
@@ -325,6 +355,39 @@ namespace WinFormsMcp.Instrumented.Tests
                 Assert.AreEqual(id, response!.Id);
                 return response;
             }
+
+            /// <summary>Queues a mutation and waits until its receipt is completed or failed.</summary>
+            internal async Task<JToken> ActAsync(string method, JToken node, Action<JObject>? configure = null)
+            {
+                JObject parameters = TargetParameters(node);
+                configure?.Invoke(parameters);
+                return await WaitForTerminalAsync(Success(await RequestAsync(method, parameters)));
+            }
+
+            internal async Task<JToken> WaitForTerminalAsync(JToken receipt)
+            {
+                DateTime deadline = DateTime.UtcNow + TimeSpan.FromSeconds(8);
+                do
+                {
+                    JToken status = Success(await RequestAsync("action_status", ReceiptParameters(receipt)));
+                    string? state = (string?)status["state"];
+                    if (state == "completed" || state == "failed") return status;
+                    await Task.Delay(25);
+                } while (DateTime.UtcNow < deadline);
+                Assert.Fail("The action reached neither completed nor failed.");
+                throw new InvalidOperationException("Unreachable assertion failure.");
+            }
+
+            /// <summary>
+            /// Occupies the UI thread until the gate opens, then runs an optional step on that thread.
+            /// Requests posted after this call queue behind it, which makes races deterministic.
+            /// </summary>
+            internal Task BlockUiAsync(ManualResetEventSlim gate, Action? afterRelease = null)
+                => OnUiAsync(() =>
+                {
+                    gate.Wait(TimeSpan.FromSeconds(20));
+                    afterRelease?.Invoke();
+                });
 
             internal async Task<JArray> TreeAsync()
             {

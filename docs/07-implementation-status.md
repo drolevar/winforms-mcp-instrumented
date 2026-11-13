@@ -57,7 +57,7 @@ compiler warnings or errors.
 | Debug, Release/stripped and instrumented Release solution builds | Passed, zero warnings/errors |
 | Protocol tests (net10.0) | 20 passed |
 | Server contract tests (net10.0, new) | 8 passed |
-| **Windows integration tests (net48)** | **8 passed**: 7 supplied plus 1 added for `ensure_visible` ordering |
+| **Windows integration tests (net48)** | **19 passed**: 7 supplied, 1 for `ensure_visible` ordering, 11 for per-control validation, paging bounds, redaction, exclusion, detachment and UI-thread races (see below) |
 | Desktop exercise through the real sidecar and demo (`eng/exercise-demo.py`) | 57 of 57 checks passed (matrix below) |
 | Runtime endpoint check (`eng/verify-no-endpoint.ps1`) | Passed: with activation variables set, the instrumented build opened its pipe and the stripped build opened none |
 | Stripped sample: dependency graph, PE metadata, output files, config | Passed |
@@ -85,6 +85,28 @@ turned out to be:
 
 Both defects were invisible to the supplied tests: the first needs a never-shown
 tab plus a scrollable container, the second only appears in the MCP result text.
+
+### What the Windows suite pins
+
+Beyond the supplied discovery/identity/modal/authentication tests, the suite
+asserts these contracts against a real pipe and message loop:
+
+| Contract | Test approach |
+| --- | --- |
+| 17 refused actions fail their receipt with a specific code (`disabled_control`, `hidden_control`, `read_only`, `unsupported_operation`, `invalid_argument`) | Table of requests; validation is observed on the UI thread, after the receipt was accepted |
+| Valid `set_value`/`set_text` change the control and report `handlerReturned` | Read back through the tree |
+| List paging: 100-item cap, last page, empty page at `startIndex == count`, `invalid_argument` past it or for `maxItems` 0/101 | 250-item list |
+| Grid reads: 200-row cap, `hasMoreRows`, tail page, 50-column cap, non-grid target refused | 250-row grid |
+| Text beyond `MaxTextLength` is cut and flagged `textTruncated`; password text never appears in tree or inspect output | 5,000-character text; secret-string search |
+| Excluded subtrees are absent; renaming a live control into an exclusion makes its ID `stale_target` | Builder exclusion predicate |
+| A control removed but alive is untargetable and regains the *same* ID on re-adding | Remove, inspect, re-add |
+| A busy UI thread yields `ui_timeout`, and the bridge recovers afterwards | UI thread held on a gate past the 3 s test timeout |
+| An action accepted while the UI thread is held, whose target is then disposed, fails with `stale_target` and never runs its handler | Gate releases a step that disposes the target before the queued action starts; click counter stays 0 |
+| The 33rd pending action is refused with `action_limit`; the journal accepts work again after draining | 32 receipts queued behind a held UI thread |
+
+The three behaviors most likely to regress silently (the pending-action limit,
+password redaction and the disabled-control check) were each broken on purpose
+once; exactly the corresponding tests failed.
 
 ### What the desktop exercise covered
 
@@ -121,6 +143,12 @@ The 100% scale of both displays is a limit of this evidence; see below.
 - **Visible pixels only.** Capture may include an overlapping window and fails
   for unavailable or minimized targets. No offscreen, hidden-window, or
   occlusion-free capture is claimed.
+- **Validated in a remote session.** The desktop exercise ran in a Windows
+  remote-display session (the video adapters included "Microsoft Remote Display
+  Adapter"). Screen capture worked there, but a remote session's display
+  topology and scaling are controlled by the client, and a disconnected session
+  has no capturable desktop. Per-monitor-DPI work is deferred until it can run
+  on a local interactive desktop.
 - **Display scaling is validated at 100% only.** Both test displays were at 100%
   and the demo window reported 96 DPI. Per-monitor-DPI-aware behavior (the demo
   manifest declares PerMonitorV2), a window straddling two monitors with
@@ -143,12 +171,13 @@ The 100% scale of both displays is a limit of this evidence; see below.
 
 ## Prioritized continuation
 
-1. Run the desktop exercise at 125%/150% and with two monitors at different
-   scales; add minimize-then-capture to it. Record results here.
-2. Add tests for representative standard controls that the exercise touches but
-   the suite does not pin (action validation per control, item paging, a
-   timeout/disposal race on the UI thread, a control disposed while an action is
-   `queued`).
+1. On a **local** interactive desktop (deferred: the first run was remote), run
+   the desktop exercise at 125%/150% and with two monitors at different scales;
+   add minimize-then-capture to it. Record results here.
+2. Extend the suite to ListView, TreeView, TabControl and DateTimePicker
+   validation, and to a timeout race for *mutations* (the suite covers read
+   timeouts and queued-action disposal). The first group of standard-control
+   tests is done.
 3. Add ToolStrip/menu adapters and a deliberate virtual-element identity model.
    Extend multi-UI-thread coverage through registered dispatchers.
 4. Add alternative capture backends only with distinct capability reporting and
