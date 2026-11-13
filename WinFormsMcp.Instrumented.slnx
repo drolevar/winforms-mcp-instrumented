@@ -35,6 +35,7 @@
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/WinFormsMcp.Instrumented.Protocol.Tests/WinFormsMcp.Instrumented.Protocol.Tests.csproj" />
+    <Project Path="tests/WinFormsMcp.Instrumented.Server.Tests/WinFormsMcp.Instrumented.Server.Tests.csproj" />
     <Project Path="tests/WinFormsMcp.Instrumented.Tests/WinFormsMcp.Instrumented.Tests.csproj" />
   </Folder>
 </Solution>

@@ -7,6 +7,9 @@
     <Description>External stdio MCP server for instrumented WinForms applications.</Description>
   </PropertyGroup>
   <ItemGroup>
+    <InternalsVisibleTo Include="WinFormsMcp.Instrumented.Server.Tests" />
+  </ItemGroup>
+  <ItemGroup>
     <PackageReference Include="ModelContextProtocol" />
     <PackageReference Include="Microsoft.Extensions.Hosting" />
     <ProjectReference Include="../WinFormsMcp.Instrumented.Protocol/WinFormsMcp.Instrumented.Protocol.csproj" />

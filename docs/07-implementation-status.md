@@ -7,9 +7,11 @@ checks establish what exists today. Keeping those distinct prevents a coding
 agent or package consumer from assuming a draft feature has been verified on a
 Windows desktop merely because it compiles.
 
-This snapshot was prepared on **2026-11-13**. It is an implementation draft,
-not a published release. The source archive uses the explicit MinVer fallback
-version `0.1.0-alpha.0` when it has no Git history.
+This snapshot was updated on **2026-11-13** after the first execution on
+Windows. It is an implementation draft, not a published release. In a Git
+checkout MinVer derives the version from history and tags (`0.1.0-alpha.0.N`
+before any tag exists); a source archive without Git history uses the explicit
+fallback `0.1.0-alpha.0`.
 
 ## Implemented source
 
@@ -27,7 +29,7 @@ version `0.1.0-alpha.0` when it has no Git history.
 | Data | Bounded DataGridView row/column collection-index reads using formatted cell values |
 | Capture | Visible-screen PNGs of control/window/region/app windows; ancestor and desktop clipping; metadata and combined image budget |
 | Builder | Optional limits, subtree exclusions and named actions for application-defined control types |
-| Sidecar | Official MCP SDK stdio host, 19 fixed tools, startup-independent process management and bounded retained output |
+| Sidecar | Official MCP SDK stdio host, 19 fixed tools, startup-independent process management and bounded retained output; uniform camelCase `error.code/message/details` for sidecar and bridge errors |
 | Shipping exclusion | Conditional consumer dependency and source symbol; graph, PE metadata, output and config checks |
 | Sample | Standard controls, modal dialog, replacement/reparenting/HWND recreation, grid/tree, scrolling and DPI-aware manifest |
 
@@ -36,59 +38,74 @@ tools use observed `generation`/`id` targets. Selection positions and tree paths
 are observations of the current item view, not persistent identities for
 virtual elements.
 
-## Validation performed in this environment
+## Validation performed
 
-The build host is Linux with a locally installed .NET SDK **10.0.404**. The SDK
-download was checked against the SHA-512 hash in Microsoft's release metadata.
+This section records what was actually executed, where, and what remains
+unexecuted. It supersedes the cross-build-only record of the draft's first
+snapshot. A test that is provided but was not run is listed as not run.
+
+### Windows validation, 2026-11-13
+
+Host: Windows 11 Enterprise 10.0.26300, .NET SDK 10.0.401 (selected by
+`global.json` among several installed SDKs), PowerShell 7.6, Python 3.12, two
+2560×1440 displays at **100% scale** in an interactive session. The complete
+`eng/build.ps1 -DesktopExercise` workflow passed in one invocation with zero
+compiler warnings or errors.
 
 | Check | Result |
 | --- | --- |
-| Solution format and project evaluation | Passed |
-| Full solution Debug cross-build | Passed, zero warnings/errors |
-| Full solution Release cross-build | Passed, zero warnings/errors |
-| Protocol tests on .NET 10 | 20 passed, zero failed/skipped |
-| MCP stdio smoke test | Passed: initialize, 19 tools, schemas, offline status, unavailable-app error, session continuity, EOF shutdown |
-| Stripped Release consumer | Passed: no bridge/protocol/JSON dependency, no forbidden PE assembly references, no instrumentation output |
-| Explicitly instrumented Release consumer | Passed: bridge present |
-| Clean instrumented-to-disabled rebuild | Passed: stripping assertions hold after the transition |
-| Stripping verifier negative control | Passed: correctly rejected the instrumented build |
-| NuGet packaging | Passed: bridge, protocol and server tool packages at `0.1.0-alpha.0` |
-| Installed .NET tool | Passed: installed the locally packed server into an isolated tool directory and repeated the 19-tool MCP smoke test through its generated command |
-| Actual packed-package consumer | Passed: isolated net48 consumer restored from the local feed, with a fresh cache; enabled/disabled builds and stripping checks passed |
-| Package license metadata | Passed: MIT expression verified |
-| Windows integration test project | Cross-compiled, zero warnings/errors; seven tests present |
-| Windows integration test execution | **Not run: this host is Linux** |
-| Interactive screen/DPI capture | **Not run: requires a Windows interactive desktop** |
+| Debug, Release/stripped and instrumented Release solution builds | Passed, zero warnings/errors |
+| Protocol tests (net10.0) | 20 passed |
+| Server contract tests (net10.0, new) | 8 passed |
+| **Windows integration tests (net48)** | **8 passed**: 7 supplied plus 1 added for `ensure_visible` ordering |
+| Desktop exercise through the real sidecar and demo (`eng/exercise-demo.py`) | 57 of 57 checks passed (matrix below) |
+| Runtime endpoint check (`eng/verify-no-endpoint.ps1`) | Passed: with activation variables set, the instrumented build opened its pipe and the stripped build opened none |
+| Stripped sample: dependency graph, PE metadata, output files, config | Passed |
+| Clean instrumented-to-stripped rebuild | Passed |
+| Stripping verifier negative control | Passed: rejected an instrumented build |
+| NuGet packing (bridge, protocol, server) | Passed, version `0.1.0-alpha.0.2` (MinVer: no tag yet, two commits of height) |
+| Packed-package consumer, enabled and stripped | Passed, after the fixture fix below |
+| Packed server installed as a .NET tool, offline MCP smoke test | Passed: 19 tools, strict camelCase error code |
+| Release server MCP smoke test | Passed |
 
-CI is provided, but no remote CI run is claimed by this snapshot.
+The first run of the documented script was not clean. The failures and what they
+turned out to be:
 
-The environment restricts local socket creation used by out-of-process MSBuild
-nodes. Validation used serial/in-process compilation options:
+| Observation | Cause | Resolution |
+| --- | --- | --- |
+| `build.ps1` refused to load ("not digitally signed") | Archive extraction left a Mark-of-the-Web on the scripts; policy is `RemoteSigned` | Not a code defect. Documented in [build and distribution](06-build-and-distribution.md); the repository does not bypass the safeguard |
+| `NU1101` in the package-consumer check | A user-level `packageSourceMapping` made the local feed ineligible | Fixed in `eng/verify-package-consumer.ps1`: the fixture declares its own mapping |
 
-```text
--m:1 /nodeReuse:false /p:BuildInParallel=false /p:UseSharedCompilation=false
-```
+### Defects found by running on Windows, and fixed
 
-That is a host-specific verification adjustment. The ordinary Windows build
-workflow does not require those options.
+| Defect | Evidence | Fix and regression coverage |
+| --- | --- | --- |
+| `ensure_visible` on a control inside a never-shown tab selected the tab but did not scroll, yet its receipt said `completed`; a later `scroll_control` then landed at the wrong offset | Child 1,000 px below the viewport after a `completed` receipt | Two-pass reveal: select ancestor tabs, then scroll innermost-out. Regression test fails on the old code (`child top 1781, viewport 79..243`) and passes on the new; desktop exercise covers it |
+| Application-bridge errors reached MCP clients as `Code`/`Message`/`Details` while sidecar errors used `code`/`message`; `smoke-mcp.py` silently accepted both | Strict-key exercise run failed four checks | Single `ErrorObject` renderer used at both sites; server tests pin the shape; smoke test and exercise now require `code` |
 
-The complete `eng/build.ps1` workflow was also run in one invocation after the
-final source changes, including package creation and the isolated consumer
-checks. The final Release server passed the MCP smoke test. The test runner
-printed an informational fallback notice for `VSTEST_ARTIFACTS_DIRECTORY`; the
-protocol run completed with all 20 tests passing.
+Both defects were invisible to the supplied tests: the first needs a never-shown
+tab plus a scrollable container, the second only appears in the MCP result text.
 
-## Windows test coverage provided
+### What the desktop exercise covered
 
-The seven integration tests use a real named pipe and an STA thread running a
-WinForms message loop. They cover dynamic discovery, stale IDs after object
-replacement, stable IDs after HWND recreation, stable IDs after reparenting,
-stale generations, modal action progress, and authentication/reconnection.
+Run `eng/exercise-demo.py` (or `eng/build.ps1 -DesktopExercise`). Each item
+asserts observable state, not merely that a receipt completed.
 
-Run `eng/build.ps1` on Windows to execute them. The script also restores and
-checks the consumer variants, packs the libraries/tool, and verifies consumption
-of the actual local NuGet packages. See the build document for the complete
-workflow.
+| Area | Verified behavior |
+| --- | --- |
+| Lifecycle | Status offline, launch, `stop`, relaunch gives a new generation, `restart`; MCP stayed connected throughout |
+| Text and buttons | `set_text`, then `invoke_control` on `btnGreet`, then `lblStatus` read back as `Hello, Ada!` |
+| Values | Check box, radio, numeric (and out-of-range rejection with `invalid_argument`), trackbar, date, combo, list |
+| Redaction | Password text is `null` and `textRedacted` in tree and inspect, including after `set_text` |
+| Tabs, grid, tree | Tab selection, bounded `read_grid` page, cell selection, grid row scroll, tree path selection |
+| Scrolling | `ensure_visible` across tab and panel; absolute `scroll_control` offset verified from reported geometry |
+| Modal dialog | Opener returns a `queued` receipt immediately; stays `started` while the dialog is listed and inspectable; closing completes both actions; handler continuation ran |
+| Identity | HWND recreation and reparenting keep the ID; replacement changes it; the old ID gives `stale_target` for inspect and for a queued mutation; a previous generation gives `stale_generation` |
+| Capture | Control, partially clipped child (reported `clipped`, visible height equals the container edge), fully scrolled-out child refused with `capture_unavailable`, region (exact pixel size), window with frame, application (two images while a modal dialog is open), zero-size region rejected; PNG dimensions equal reported pixels; metadata declares `screen_copy` and possible occlusion |
+| Desktop edges | Window dragged past the right edge, then past the left and bottom edges of the virtual desktop: capture was clipped to the desktop and reported `clipped` with the requested bounds |
+| Overlap | The application capture taken during the modal dialog shows the dialog drawn over the main window, as documented |
+
+The 100% scale of both displays is a limit of this evidence; see below.
 
 ## Current limitations
 
@@ -102,8 +119,17 @@ workflow.
   simulate the full physical keyboard/mouse event sequence. There is no generic
   `SendInput` fallback in this draft.
 - **Visible pixels only.** Capture may include an overlapping window and fails
-  for unavailable or minimized targets. Mixed-DPI behavior still needs Windows
-  validation. No offscreen, hidden-window, or occlusion-free capture is claimed.
+  for unavailable or minimized targets. No offscreen, hidden-window, or
+  occlusion-free capture is claimed.
+- **Display scaling is validated at 100% only.** Both test displays were at 100%
+  and the demo window reported 96 DPI. Per-monitor-DPI-aware behavior (the demo
+  manifest declares PerMonitorV2), a window straddling two monitors with
+  different scales, and a scale change while running were **not executed**:
+  that needs display-setting changes on a machine the validator did not own.
+  Treat 125%/150%/mixed-scale crops as unverified until run.
+- **Minimized-window rejection is covered by code, not by the exercise.** The
+  exercise did not minimize the demo window; `ScreenCapture` rejects it, but no
+  executed check shows that.
 - **Exclusion is not pixel redaction.** A containing-window screenshot can show
   pixels belonging to an excluded child. Password text is omitted from control
   metadata; the screenshot is the actual screen.
@@ -117,10 +143,12 @@ workflow.
 
 ## Prioritized continuation
 
-1. Run the existing Windows suite and the manual desktop exercise below. Resolve
-   observed failures before calling the package production-ready.
-2. Add tests for representative standard controls, action validation, item
-   paging, timeout/disposal races and ancestor clipping on Windows.
+1. Run the desktop exercise at 125%/150% and with two monitors at different
+   scales; add minimize-then-capture to it. Record results here.
+2. Add tests for representative standard controls that the exercise touches but
+   the suite does not pin (action validation per control, item paging, a
+   timeout/disposal race on the UI thread, a control disposed while an action is
+   `queued`).
 3. Add ToolStrip/menu adapters and a deliberate virtual-element identity model.
    Extend multi-UI-thread coverage through registered dispatchers.
 4. Add alternative capture backends only with distinct capability reporting and
@@ -128,16 +156,18 @@ workflow.
 5. Add distribution metadata for the actual remote repository, choose a release
    version/tag, and publish only when explicitly requested.
 
-## Manual Windows desktop exercise
+## Desktop exercise
 
-Launch the instrumented demo through the sidecar. Inspect the tree, edit
-`txtName`, click `btnGreet`, and verify `lblStatus`. Exercise the modal dialog
-while its opening receipt is `started`. On the Dynamic identity tab, observe
-the ID across replacement, reparenting, and native-handle recreation. Select and
-scroll grid/list/tree controls. Capture a partially clipped child, a region,
-a window, and the application at multiple display scales. Repeat with a window
-partially outside the desktop and with another window overlapping it; check the
-reported bounds and limitations against the pixels. Finally start the stripped
-sample with activation variables set and confirm there is no bridge endpoint.
+The exercise formerly described here as a manual procedure is now
+`eng/exercise-demo.py`; the matrix above lists what it asserts. Run it with
 
-This exercise checks behavior that a Linux cross-build cannot establish.
+```powershell
+./eng/build.ps1 -DesktopExercise
+```
+
+It launches the Debug demo through the real sidecar, moves the demo window across
+the desktop edges, and writes screenshots and `exercise-report.json` under
+`artifacts/validation/`. Look at the saved images as well as the pass/fail result:
+the checks compare reported geometry and pixel sizes, not image content. The
+procedure still has two manual parts: repeat it at other display scales, and
+inspect the screenshots when changing capture code.

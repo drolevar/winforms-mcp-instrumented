@@ -118,6 +118,28 @@ namespace WinFormsMcp.Instrumented.Tests
         }
 
         [TestMethod]
+        public async Task EnsureVisibleSelectsTheAncestorTabBeforeScrollingItsContainer()
+        {
+            using (var app = new TestApplication())
+            {
+                // The second tab has never been shown, so its AutoScroll panel is hidden and unlaid-out.
+                JObject far = await app.FindAsync("FarChild");
+                JToken receipt = Success(await app.RequestAsync("ensure_visible", TargetParameters(far)));
+                await app.WaitForCompletionAsync(receipt);
+
+                Assert.AreEqual(1, (int)(await app.FindAsync("Tabs"))["selectedIndex"]!, "The ancestor tab was not selected.");
+                JObject panel = await app.FindAsync("ScrollPanel");
+                JObject child = await app.FindAsync("FarChild");
+                int panelTop = (int)panel["bounds"]!["y"]!;
+                int panelBottom = panelTop + (int)panel["bounds"]!["height"]!;
+                int childTop = (int)child["bounds"]!["y"]!;
+                Assert.IsTrue(childTop >= panelTop && childTop < panelBottom,
+                    "The child was not scrolled into its container's viewport: child top " + childTop +
+                    ", viewport " + panelTop + ".." + panelBottom + ".");
+            }
+        }
+
+        [TestMethod]
         public async Task AnIncorrectTokenIsRejectedAndAValidClientCanReconnect()
         {
             using (var app = new TestApplication())
@@ -210,6 +232,7 @@ namespace WinFormsMcp.Instrumented.Tests
             internal RecreatingButton HandleButton { get; private set; } = null!;
             internal Panel RightPanel { get; private set; } = null!;
             internal Button ReparentedChild { get; private set; } = null!;
+            internal TabControl Tabs { get; private set; } = null!;
 
             private void Run()
             {
@@ -240,6 +263,15 @@ namespace WinFormsMcp.Instrumented.Tests
                         left.Controls.Add(ReparentedChild);
                         window.Controls.Add(left);
                         window.Controls.Add(RightPanel);
+                        Tabs = new TabControl { Name = "Tabs", Left = 250, Top = 0, Width = 230, Height = 190 };
+                        var firstPage = new TabPage("First") { Name = "FirstPage" };
+                        var secondPage = new TabPage("Second") { Name = "SecondPage" };
+                        var scrolling = new Panel { Name = "ScrollPanel", Dock = DockStyle.Fill, AutoScroll = true };
+                        scrolling.Controls.Add(new TextBox { Name = "FarChild", Left = 10, Top = 1700, Width = 120 });
+                        secondPage.Controls.Add(scrolling);
+                        Tabs.TabPages.Add(firstPage);
+                        Tabs.TabPages.Add(secondPage);
+                        window.Controls.Add(Tabs);
                         window.Shown += (_, __) => ready.Set();
                         Application.Run(window);
                     }

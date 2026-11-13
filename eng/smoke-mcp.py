@@ -187,7 +187,7 @@ def exercise(client: Client) -> dict[str, Any]:
     windows_result = client.tool("list_windows")
     check(windows_result.get("isError") is True, "list_windows should fail explicitly while the bridge is unavailable.")
     offline_error = text_json(windows_result).get("error", {})
-    error_code = offline_error.get("code", offline_error.get("Code"))
+    error_code = offline_error.get("code")  # strict: camelCase is the documented contract
     check(error_code == "app_unavailable", "Unexpected offline error: " + str(error_code))
 
     # A failed UI tool must not disconnect the MCP session.

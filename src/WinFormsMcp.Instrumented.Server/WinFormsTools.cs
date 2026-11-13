@@ -204,7 +204,7 @@ internal sealed class WinFormsTools(ApplicationSession session)
     {
         ["generation"] = response.Generation,
         ["result"] = response.Result,
-        ["error"] = response.Error == null ? null : JObject.FromObject(response.Error)
+        ["error"] = response.Error == null ? null : ApplicationSession.ErrorObject(response.Error)
     }, response.Error != null);
     private static CallToolResult Error(string code, string message) => JsonResult(ApplicationSession.Error(code, message), true);
     private static CallToolResult JsonResult(JObject value, bool? error = null) => new()

@@ -29,7 +29,7 @@ can have effects beyond its visual state.
 | `set_checked` | `generation`, `id`, `value` | Boolean state for check/radio controls |
 | `select_control` | `generation`, `id`; `index` or `row`+`column` or `path` | Selection appropriate to the observed control type |
 | `scroll_control` | `generation`, `id`; `x`/`y` or `row`/`column` | Absolute container offsets or indexed list/grid scrolling |
-| `ensure_visible` | `generation`, `id` | Scroll ancestors and select ancestor tabs as needed |
+| `ensure_visible` | `generation`, `id` | Select ancestor tabs, then scroll ancestor containers; see [reveal order](04-controls-and-capture.md) |
 | `read_grid` | `generation`, `id`, bounded row/column range | Formatted DataGridView values |
 | `capture` | `scope="application"`, optional target, `includeFrame=false`, optional `region` | PNG image content and capture metadata |
 | `action_status` | `generation`, `actionId` | Queued action progress/result/error |
@@ -96,7 +96,19 @@ behavior on the target desktop.
 ## Errors, lifecycle and retries
 
 Expected failures are MCP tool results with `isError=true` and a structured
-error code/message. Reading a receipt is itself an observation: `action_status`
+error object. Every error, whether the sidecar or the application bridge
+produced it, has the same camelCase shape, so an agent can branch on `code`
+without checking where the failure originated:
+
+```json
+{"generation":"<generation>","result":null,
+ "error":{"code":"stale_target","message":"The observed control no longer exists.","details":null}}
+```
+
+`details` is `null` unless the error carries structure, for example
+`{"delivery":"not_sent","automaticRetry":false}` on `app_unavailable`. (An early
+draft serialized bridge errors with the CLR property names `Code`/`Message`/
+`Details`; a test now pins the camelCase contract.) Reading a receipt is itself an observation: `action_status`
 can succeed while returning `state="failed"` and the action's `error`. Check that
 state before treating a mutation as successful. `app_status` itself succeeds while reporting
 `bridgeAvailable=false` when the app is offline. Attach mode has no owned

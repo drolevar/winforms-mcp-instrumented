@@ -1,0 +1,428 @@
+#!/usr/bin/env python3
+"""Drive the sample application through the real MCP sidecar on an interactive Windows desktop.
+
+This is the executable form of the manual exercise in docs/07-implementation-status.md.
+It launches the sidecar, which launches the instrumented demo, and performs the
+observe/act/verify cycles for standard controls, the modal dialog, identity changes,
+captures and the application restart. Every check is recorded; the script exits
+non-zero if any check fails. It never touches processes it did not start.
+
+    python eng/exercise-demo.py --captures artifacts/validation/captures -- \
+        dotnet <server dll> --app <instrumented InstrumentedDemo.exe>
+
+Requires Windows, an interactive desktop, and an instrumented (Debug or explicit
+EnableWinFormsMcpInstrumentation=true) demo. Python standard library only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import importlib.util
+import json
+import pathlib
+import struct
+import sys
+import time
+from typing import Any
+
+_spec = importlib.util.spec_from_file_location("smoke_mcp", pathlib.Path(__file__).with_name("smoke-mcp.py"))
+smoke = importlib.util.module_from_spec(_spec)  # type: ignore[arg-type]
+sys.modules["smoke_mcp"] = smoke
+_spec.loader.exec_module(smoke)  # type: ignore[union-attr]
+
+
+class Report:
+    def __init__(self) -> None:
+        self.results: list[dict[str, Any]] = []
+        self.notes: dict[str, Any] = {}
+
+    def check(self, name: str, condition: bool, detail: Any = None) -> bool:
+        self.results.append({"check": name, "passed": bool(condition), "detail": detail if not condition else None})
+        print(("PASS  " if condition else "FAIL  ") + name + ("" if condition else "  -> " + str(detail)[:600]))
+        return bool(condition)
+
+    @property
+    def failed(self) -> list[dict[str, Any]]:
+        return [r for r in self.results if not r["passed"]]
+
+
+class Tools:
+    """Thin typed wrapper over tools/call that parses the JSON text block."""
+
+    def __init__(self, client: Any) -> None:
+        self.client = client
+
+    def call(self, name: str, **arguments: Any) -> tuple[bool, dict[str, Any], list[dict[str, Any]]]:
+        result = self.client.call("tools/call", {"name": name, "arguments": arguments})
+        texts = [b for b in result.get("content", []) if b.get("type") == "text"]
+        images = [b for b in result.get("content", []) if b.get("type") == "image"]
+        parsed = json.loads(texts[0]["text"]) if texts else {}
+        return bool(result.get("isError")), parsed, images
+
+    def result(self, name: str, **arguments: Any) -> dict[str, Any]:
+        is_error, parsed, _ = self.call(name, **arguments)
+        if is_error:
+            raise smoke.SmokeFailure(name + " failed: " + json.dumps(parsed)[:500])
+        return parsed.get("result", parsed)
+
+
+def error_code(parsed: dict[str, Any]) -> str | None:
+    # Strict on purpose: every tool error must use the documented camelCase "code" key.
+    error = parsed.get("error") or {}
+    return error.get("code")
+
+
+class Desktop:
+    """Win32 helpers used only to arrange the demo window; the product has no such tool."""
+
+    def __init__(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+        self.ctypes, self.wintypes = ctypes, wintypes
+        self.user32 = ctypes.windll.user32
+        self.user32.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))  # PerMonitorV2: no coordinate virtualization
+        self.user32.GetDpiForWindow.restype = ctypes.c_uint
+
+    def virtual_screen(self) -> tuple[int, int, int, int]:
+        m = self.user32.GetSystemMetrics
+        left, top, width, height = m(76), m(77), m(78), m(79)
+        return left, top, left + width, top + height
+
+    def main_window(self, pid: int) -> int:
+        ctypes, wintypes = self.ctypes, self.wintypes
+        found: list[int] = []
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def visit(hwnd: int, _: int) -> bool:
+            owner = wintypes.DWORD()
+            self.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+            if owner.value == pid and self.user32.IsWindowVisible(hwnd) and not self.user32.GetWindow(hwnd, 4):
+                found.append(hwnd)
+            return True
+
+        self.user32.EnumWindows(visit, 0)
+        if not found:
+            raise smoke.SmokeFailure("No visible top-level window for process " + str(pid))
+        return found[0]
+
+    def rect(self, hwnd: int) -> tuple[int, int, int, int]:
+        r = self.wintypes.RECT()
+        self.user32.GetWindowRect(hwnd, self.ctypes.byref(r))
+        return r.left, r.top, r.right, r.bottom
+
+    def move(self, hwnd: int, x: int, y: int) -> None:
+        # SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
+        self.user32.SetWindowPos(hwnd, 0, x, y, 0, 0, 0x0001 | 0x0004 | 0x0010)
+
+    def dpi(self, hwnd: int) -> int:
+        return int(self.user32.GetDpiForWindow(hwnd))
+
+
+def png_size(data: bytes) -> tuple[int, int]:
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise smoke.SmokeFailure("Image block is not a PNG.")
+    return struct.unpack(">II", data[16:24])
+
+
+class Session:
+    def __init__(self, tools: Tools, report: Report) -> None:
+        self.tools = tools
+        self.report = report
+        self.generation = ""
+        self.nodes: dict[str, dict[str, Any]] = {}
+
+    def refresh(self, **arguments: Any) -> dict[str, dict[str, Any]]:
+        tree = self.tools.result("control_tree", **arguments)
+        self.generation = tree["generation"]
+        self.nodes = {}
+        for node in tree["nodes"]:
+            if node["name"]:
+                self.nodes.setdefault(node["name"], node)
+        self.truncated = tree["truncated"]
+        return self.nodes
+
+    def node(self, name: str) -> dict[str, Any]:
+        self.refresh()
+        if name not in self.nodes:
+            raise smoke.SmokeFailure("Control not found in tree: " + name)
+        return self.nodes[name]
+
+    def inspect(self, name: str, **extra: Any) -> dict[str, Any]:
+        node = self.node(name)
+        return self.tools.result("inspect_control", generation=node["generation"], id=node["id"], **extra)
+
+    def act(self, tool: str, name: str, **arguments: Any) -> dict[str, Any]:
+        node = self.node(name)
+        receipt = self.tools.result(tool, generation=node["generation"], id=node["id"], **arguments)
+        return self.wait(receipt)
+
+    def wait(self, receipt: dict[str, Any], accept: tuple[str, ...] = ("completed", "failed"), timeout: float = 8.0) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout
+        while True:
+            status = self.tools.result("action_status", generation=receipt["generation"], actionId=receipt["actionId"])
+            if status["state"] in accept:
+                return status
+            if time.monotonic() > deadline:
+                raise smoke.SmokeFailure("Action did not reach " + "/".join(accept) + ": " + json.dumps(status))
+            time.sleep(0.05)
+
+    def wait_for_node(self, name: str, timeout: float = 5.0) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            self.refresh()
+            if name in self.nodes:
+                return self.nodes[name]
+            time.sleep(0.05)
+        raise smoke.SmokeFailure("Control did not appear: " + name)
+
+
+def exercise(client: Any, report: Report, captures: pathlib.Path) -> None:
+    tools = Tools(client)
+    client.call("initialize", {"protocolVersion": "2025-11-25", "capabilities": {},
+                               "clientInfo": {"name": "winforms-mcp-instrumented-exercise", "version": "0.1.0"}})
+    client.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    s = Session(tools, report)
+
+    # --- lifecycle: offline, launch ---------------------------------------
+    status = tools.result("app_status")
+    report.check("app_status works before launch", status.get("bridgeAvailable") is False, status)
+    launched = tools.result("app_launch")
+    status = tools.result("app_status")
+    report.check("app_launch connects the bridge", status.get("bridgeAvailable") is True, [launched, status])
+    first_generation = status.get("generation")
+
+    windows = tools.result("list_windows")
+    report.check("list_windows reports the main form", any(w["name"] == "MainForm" for w in windows["windows"]), windows)
+    s.refresh()
+    report.check("tree is not truncated at default limits", not s.truncated)
+    report.check("tree has the standard controls", all(n in s.nodes for n in
+                 ("txtName", "btnGreet", "chkEnabled", "numericValue", "dateValue", "listChoice", "dataGrid", "treeItems")))
+
+    # --- standard controls -------------------------------------------------
+    password = s.nodes["txtPassword"]
+    report.check("password text is redacted in the tree", password["text"] is None and password["textRedacted"] is True, password)
+
+    r = s.act("set_text", "txtName", text="Ada")
+    report.check("set_text completes", r["state"] == "completed", r)
+    report.check("set_text changed the control", s.inspect("txtName")["text"] == "Ada")
+    r = s.act("invoke_control", "btnGreet")
+    report.check("invoke_control click completes", r["state"] == "completed", r)
+    report.check("button handler changed application state", s.node("lblStatus")["text"] == "Hello, Ada!", s.nodes["lblStatus"])
+
+    r = s.act("set_checked", "chkEnabled", value=True)
+    report.check("set_checked check box", r["state"] == "completed" and s.inspect("chkEnabled")["checked"] is True, r)
+    r = s.act("set_checked", "radioChoice", value=True)
+    report.check("set_checked radio button", r["state"] == "completed" and s.inspect("radioChoice")["checked"] is True, r)
+    r = s.act("set_value", "numericValue", value=42.5)
+    report.check("set_value numeric", r["state"] == "completed" and float(s.inspect("numericValue")["value"]) == 42.5, r)
+    r = s.act("set_value", "numericValue", value=1000)
+    report.check("set_value rejects out-of-range numeric", r["state"] == "failed" and r["error"]["code"] == "invalid_argument", r)
+    r = s.act("set_value", "trackValue", value=70)
+    report.check("set_value trackbar", r["state"] == "completed" and s.inspect("trackValue")["value"] == 70, r)
+    r = s.act("set_value", "dateValue", value="2026-06-15")
+    report.check("set_value date", r["state"] == "completed" and s.inspect("dateValue")["value"].startswith("2026-06-15"), r)
+    r = s.act("select_control", "comboChoice", index=2)
+    report.check("select combo item", r["state"] == "completed" and s.inspect("comboChoice")["selectedIndex"] == 2, r)
+    r = s.act("select_control", "listChoice", index=1)
+    items = s.inspect("listChoice")
+    report.check("select list item", r["state"] == "completed" and items["selectedIndex"] == 1 and len(items["items"]) == 4, items)
+    r = s.act("set_text", "txtPassword", text="x")
+    report.check("set_text on a password box is accepted but value stays redacted",
+                 r["state"] == "completed" and s.inspect("txtPassword")["text"] is None, r)
+
+    # --- tabs, grid, tree, scrolling --------------------------------------
+    r = s.act("select_control", "mainTabs", index=2)
+    report.check("select tab page", r["state"] == "completed" and s.inspect("mainTabs")["selectedIndex"] == 2, r)
+    grid_node = s.node("dataGrid")
+    grid = tools.result("read_grid", generation=grid_node["generation"], id=grid_node["id"], startRow=5, rowCount=3)
+    report.check("read_grid returns the requested page", [row["index"] for row in grid["rows"]] == [5, 6, 7]
+                 and grid["rows"][0]["cells"][1] == "Item 5", grid)
+    r = s.act("select_control", "dataGrid", row=10, column=1)
+    report.check("select grid cell", r["state"] == "completed", r)
+    r = s.act("scroll_control", "dataGrid", row=100)
+    report.check("scroll grid to a row", r["state"] == "completed", r)
+    r = s.act("select_control", "treeItems", path=[1, 2])
+    tree_items = s.inspect("treeItems")
+    selected = [i for i in tree_items["items"] if i["selected"]]
+    report.check("select tree path", r["state"] == "completed" and selected and selected[0]["path"] == [1, 2], tree_items["items"][:12])
+
+    r = s.act("ensure_visible", "scrollText40")
+    report.check("ensure_visible selects the ancestor tab and scrolls", r["state"] == "completed", r)
+    report.check("ensure_visible made the scrolling tab current", s.inspect("mainTabs")["selectedIndex"] == 3)
+    r = s.act("scroll_control", "scrollPanel", y=400)
+    panel_bounds = s.node("scrollPanel")["bounds"]
+    first_row = s.node("scrollText0")["bounds"]
+    # scroll_control takes an absolute offset: row 0 sits 20 px below the content origin.
+    report.check("scroll_control sets the absolute offset",
+                 r["state"] == "completed" and first_row["y"] - panel_bounds["y"] == 20 - 400 + 2,
+                 [r, panel_bounds, first_row])
+
+    captures.mkdir(parents=True, exist_ok=True)
+
+    def capture(label: str, **arguments: Any) -> tuple[bool, dict[str, Any], list[tuple[int, int]]]:
+        is_error, parsed, images = tools.call("capture", **arguments)
+        sizes = []
+        for index, image in enumerate(images):
+            data = base64.b64decode(image["data"])
+            sizes.append(png_size(data))
+            (captures / f"{label}-{index}.png").write_bytes(data)
+        return is_error, parsed, sizes
+
+    panel = s.node("scrollPanel")
+    err, meta, sizes = capture("control-scrollPanel", scope="control", generation=panel["generation"], id=panel["id"])
+    report.check("capture control", not err and len(sizes) == 1, meta)
+    if sizes:
+        img = meta["images"][0]
+        report.check("capture size matches reported pixels", sizes[0] == (img["width"], img["height"]) if "width" in img else True, [sizes, img])
+    # Fully scrolled out of its viewport: the bridge must refuse rather than return unrelated pixels.
+    child = s.node("scrollText40")
+    err, meta, _ = capture("scrolled-out-child", scope="control", generation=child["generation"], id=child["id"])
+    report.check("a control scrolled out of its container is refused as capture_unavailable",
+                 err and error_code(meta) == "capture_unavailable", meta)
+    # Straddle the viewport's bottom edge: 10 px of the 21 px text box remain visible.
+    viewport = s.node("scrollPanel")["bounds"]["height"]
+    s.act("scroll_control", "scrollPanel", y=1700 - (viewport - 10))
+    child = s.node("scrollText40")
+    err, meta, sizes = capture("clipped-child", scope="control", generation=child["generation"], id=child["id"])
+    image = meta["images"][0] if not err else {}
+    # Bounds are client rectangles (the text box's 2 px border is excluded), so derive the
+    # expected visible height from the reported geometry instead of assuming a number.
+    visible_bottom = s.node("scrollPanel")["bounds"]["y"] + s.nodes["scrollPanel"]["bounds"]["height"]
+    expected_height = visible_bottom - child["bounds"]["y"]
+    report.check("a partially clipped child is captured and reported as clipped",
+                 not err and 0 < expected_height < child["bounds"]["height"]
+                 and image.get("clipped") is True and image.get("height") == expected_height
+                 and image.get("requestedBounds", {}).get("height") == child["bounds"]["height"], [expected_height, meta])
+    report.check("clipped capture PNG matches reported pixels", bool(sizes) and sizes[0] == (image.get("width"), image.get("height")), [sizes, image])
+    err, meta, sizes = capture("region", scope="control", generation=panel["generation"], id=panel["id"],
+                               region={"x": 10, "y": 10, "width": 200, "height": 80})
+    report.check("capture region", not err and sizes == [(200, 80)], [err, meta, sizes])
+    err, meta, sizes = capture("window", scope="window", generation=panel["generation"], id=panel["id"], includeFrame=True)
+    report.check("capture window with frame", not err and len(sizes) == 1, meta)
+    err, meta, sizes = capture("application", scope="application")
+    report.check("capture application", not err and len(sizes) >= 1, meta)
+    report.check("capture metadata declares its method and that occlusion is possible",
+                 not err and all(i.get("method") == "screen_copy" and i.get("occlusionPossible") is True for i in meta["images"]), meta)
+    err, meta, _ = capture("bad-region", scope="control", generation=panel["generation"], id=panel["id"],
+                           region={"x": 0, "y": 0, "width": 0, "height": 10})
+    report.check("zero-size region is rejected", err, meta)
+
+    # --- desktop boundary and DPI ------------------------------------------
+    desktop = Desktop()
+    hwnd = desktop.main_window(status["processId"])
+    report.notes["windowDpi"] = desktop.dpi(hwnd)
+    report.notes["virtualScreen"] = desktop.virtual_screen()
+    left, top, right, bottom = desktop.virtual_screen()
+    original = desktop.rect(hwnd)
+    desktop.move(hwnd, right - 600, top + 80)
+    time.sleep(0.4)
+    err, meta, sizes = capture("window-off-right-edge", scope="window", generation=panel["generation"], id=panel["id"])
+    image = meta["images"][0] if not err else {}
+    report.check("a window partly beyond the desktop is clipped to the desktop and says so",
+                 not err and image.get("clipped") is True and image["bounds"]["x"] + image["bounds"]["width"] <= right
+                 and image["requestedBounds"]["width"] > image["width"], meta)
+    desktop.move(hwnd, left - 400, bottom - 300)
+    time.sleep(0.4)
+    err, meta, sizes = capture("window-off-bottom-left", scope="window", generation=panel["generation"], id=panel["id"])
+    image = meta["images"][0] if not err else {}
+    report.check("a window beyond the left and bottom edges is clipped on both axes",
+                 not err and image.get("clipped") is True and image["bounds"]["x"] >= left
+                 and image["bounds"]["y"] + image["bounds"]["height"] <= bottom, meta)
+    desktop.move(hwnd, original[0], original[1])
+    time.sleep(0.4)
+
+    # --- modal dialog -----------------------------------------------------
+    s.act("select_control", "mainTabs", index=0)
+    opening = tools.result("invoke_control", generation=s.node("btnOpenDialog")["generation"], id=s.nodes["btnOpenDialog"]["id"])
+    report.check("modal opener returns a receipt immediately", opening["state"] == "queued", opening)
+    close = s.wait_for_node("btnCloseDialog")
+    status = tools.result("action_status", generation=opening["generation"], actionId=opening["actionId"])
+    report.check("opening action stays 'started' while the dialog is open", status["state"] == "started", status)
+    windows = tools.result("list_windows")
+    report.check("modal dialog is listed as a window", any(w["name"] == "DetailsDialog" for w in windows["windows"]), windows)
+    err, meta, sizes = capture("modal-application", scope="application")
+    report.check("application capture includes the modal dialog window", not err and len(sizes) == 2, [err, sizes])
+    closing = tools.result("invoke_control", generation=close["generation"], id=close["id"])
+    closing_status = s.wait(closing)
+    opening_status = s.wait(opening)
+    report.check("closing the dialog completes both actions",
+                 closing_status["state"] == "completed" and opening_status["state"] == "completed", [closing_status, opening_status])
+    s.refresh()
+    report.check("dialog controls leave the tree", "btnCloseDialog" not in s.nodes)
+    report.check("handler continuation ran after the dialog closed", s.nodes["lblStatus"]["text"].startswith("Modal dialog closed"), s.nodes["lblStatus"])
+
+    # --- identity ----------------------------------------------------------
+    s.act("select_control", "mainTabs", index=1)
+    editor = s.node("txtDynamic")
+    old_id, old_parent = editor["id"], editor["parentId"]
+    s.act("invoke_control", "btnRecreateHandle")
+    after = s.node("txtDynamic")
+    report.check("HWND recreation preserves the ID", after["id"] == old_id, [old_id, after["id"]])
+    s.act("invoke_control", "btnMoveEditor")
+    after = s.node("txtDynamic")
+    report.check("reparenting preserves the ID and changes the parent", after["id"] == old_id and after["parentId"] != old_parent, [after, old_parent])
+    s.act("invoke_control", "btnReplaceEditor")
+    replacement = s.node("txtDynamic")
+    report.check("replacement gets a new ID", replacement["id"] != old_id, [old_id, replacement["id"]])
+    is_error, parsed, _ = tools.call("inspect_control", generation=editor["generation"], id=old_id)
+    report.check("the old ID fails as stale_target", is_error and error_code(parsed) == "stale_target", parsed)
+    is_error, parsed, _ = tools.call("invoke_control", generation=editor["generation"], id=old_id)
+    report.check("a mutation of a stale ID fails explicitly", is_error is False or error_code(parsed) == "stale_target", parsed)
+    old_receipt = parsed.get("result") or {}
+    if old_receipt.get("actionId"):
+        report.check("stale-ID mutation receipt ends failed with stale_target",
+                     s.wait(old_receipt)["error"]["code"] == "stale_target")
+
+    # --- restart while MCP stays connected --------------------------------
+    stale = replacement
+    tools.result("app_stop")
+    status = tools.result("app_status")
+    report.check("app_stop closes the app and MCP stays up", status.get("bridgeAvailable") is False, status)
+    is_error, parsed, _ = tools.call("list_windows")
+    report.check("tools report app_unavailable after the app closed", is_error and error_code(parsed) == "app_unavailable", parsed)
+    tools.result("app_launch")
+    status = tools.result("app_status")
+    report.check("relaunch produces a new generation", status.get("bridgeAvailable") and status.get("generation") != first_generation, status)
+    is_error, parsed, _ = tools.call("inspect_control", generation=stale["generation"], id=stale["id"])
+    report.check("an ID from the previous generation fails as stale_generation", is_error and error_code(parsed) == "stale_generation", parsed)
+    tools.result("app_restart")
+    s.refresh()
+    report.check("app_restart yields a live tree again", "txtName" in s.nodes and s.generation != first_generation, s.generation)
+    tools.result("app_stop")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--timeout", type=float, default=30.0)
+    parser.add_argument("--captures", type=pathlib.Path, default=pathlib.Path("artifacts/validation/captures"))
+    parser.add_argument("--report", type=pathlib.Path, default=pathlib.Path("artifacts/validation/exercise-report.json"))
+    parser.add_argument("command", nargs=argparse.REMAINDER)
+    arguments = parser.parse_args()
+    command = arguments.command[1:] if arguments.command and arguments.command[0] == "--" else arguments.command
+    if not command:
+        parser.error("Supply the server command after --.")
+    report = Report()
+    client = smoke.Client(command, arguments.timeout)
+    try:
+        exercise(client, report, arguments.captures)
+    except (smoke.SmokeFailure, OSError, ValueError, KeyError) as error:
+        report.check("exercise ran to completion", False, repr(error))
+        for line in list(client.stderr)[-20:]:
+            print("stderr: " + line, file=sys.stderr)
+    finally:
+        # The sidecar deliberately does not kill its app when MCP closes. Stop the one this
+        # script launched (a no-op when it is already stopped) so a failed run leaves nothing behind.
+        try:
+            Tools(client).call("app_stop", force=True)
+        except Exception:
+            pass
+        client.abort()
+    arguments.report.parent.mkdir(parents=True, exist_ok=True)
+    arguments.report.write_text(json.dumps({"notes": report.notes, "checks": report.results}, indent=2))
+    print(f"\n{len(report.results) - len(report.failed)} passed, {len(report.failed)} failed")
+    return 1 if report.failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

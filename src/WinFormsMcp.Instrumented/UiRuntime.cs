@@ -707,14 +707,22 @@ internal sealed class UiRuntime : IDisposable
 
     private static void EnsureVisible(Control control)
     {
-        Control? cursor = control;
-        while (cursor?.Parent != null)
-        {
-            Control parent = cursor.Parent;
-            if (cursor is TabPage page && parent is TabControl tabs) tabs.SelectedTab = page;
-            if (parent is ScrollableControl scroll && scroll.AutoScroll) scroll.ScrollControlIntoView(cursor);
-            cursor = parent;
-        }
+        // Two passes, deliberately. Scrolling a container whose ancestor tab page is not yet
+        // current runs against a hidden, never-laid-out panel: the scroll is lost or leaves the
+        // container with a bogus offset. First make every ancestor tab current, then scroll
+        // from the innermost container outward.
+        var chain = new List<Control>();
+        for (Control? cursor = control; cursor != null && chain.Count <= 256; cursor = cursor.Parent)
+            chain.Add(cursor);
+        for (int index = 0; index + 1 < chain.Count; index++)
+            if (chain[index] is TabPage page && chain[index + 1] is TabControl tabs && !ReferenceEquals(tabs.SelectedTab, page))
+                tabs.SelectedTab = page;
+        for (int index = 0; index + 1 < chain.Count; index++)
+            if (chain[index + 1] is ScrollableControl scroll && scroll.AutoScroll)
+            {
+                scroll.PerformLayout();
+                scroll.ScrollControlIntoView(chain[index]);
+            }
         if (!control.Visible)
             throw new BridgeFailure("hidden_control", "The control remains hidden; ensure_visible does not change its Visible property.");
     }

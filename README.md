@@ -64,6 +64,13 @@ that supports `.slnx` if opening the solution in an IDE.
 dotnet build WinFormsMcp.Instrumented.slnx -c Debug
 ```
 
+The complete workflow (all tests, stripping checks, packing, and a restore of the
+packed packages) is `./eng/build.ps1`; add `-DesktopExercise` on an interactive
+desktop to also drive the demo through the real MCP server and capture the
+screen. If PowerShell reports that the script "is not digitally signed", the
+files carry a Mark-of-the-Web from an archive download; see
+[Windows host notes](docs/06-build-and-distribution.md#windows-host-notes-found-by-running-the-workflow).
+
 The default Debug sample includes the bridge. Running its executable normally
 does not open an endpoint; the server supplies activation settings when it
 launches the app.

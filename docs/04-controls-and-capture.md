@@ -116,6 +116,25 @@ position in a potentially sorted or virtualized view, not a durable row key.
 Start with honest bounded support; add adapter-specific freshness tokens or
 stable keys before promising robust targeting of virtual items.
 
+### Revealing a control: select tabs first, then scroll
+
+`ensure_visible` makes a target visible by selecting every ancestor `TabPage`
+and scrolling every ancestor `AutoScroll` container. The order is part of the
+contract. A tab page that has never been shown holds a hidden, never-laid-out
+panel. Asking that panel to scroll a child into view before its tab is current
+is lost, and it can leave the container with a displaced offset that makes a
+later explicit `scroll_control` land in the wrong place. The Windows exercise on
+2026-11-13 reproduced both effects: the receipt said `completed` while the
+child was still 1,000 pixels below the viewport. The bridge therefore selects all
+ancestor tabs in a first pass, then scrolls from the innermost container
+outward in a second pass. A regression test covers the never-shown-tab case.
+
+`ensure_visible` still does not change a control's `Visible` property and still
+reports `hidden_control` when the target remains hidden. A `completed` receipt
+means the reveal handlers returned, not that every custom-drawn or
+virtualized container honored them; verify with a fresh `control_tree` bounds
+read when position matters.
+
 ### Semantic actions and physical input are different capabilities
 
 Calling `Button.PerformClick()` or changing `TextBox.Text` uses WinForms behavior

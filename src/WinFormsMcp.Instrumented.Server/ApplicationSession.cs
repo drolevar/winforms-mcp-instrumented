@@ -44,7 +44,7 @@ internal sealed class ApplicationSession : IDisposable
         RpcResponse hello = await Bridge.CallAsync("hello", null, cancellationToken).ConfigureAwait(false);
         status["bridgeAvailable"] = hello.Error == null;
         status["generation"] = hello.Generation;
-        status["bridge"] = hello.Error == null ? hello.Result : JObject.FromObject(hello.Error);
+        status["bridge"] = hello.Error == null ? hello.Result : ErrorObject(hello.Error);
         return status;
     }
 
@@ -183,6 +183,17 @@ internal sealed class ApplicationSession : IDisposable
     internal static JObject Error(string code, string message) => new()
     {
         ["error"] = new JObject { ["code"] = code, ["message"] = message }
+    };
+
+    /// <summary>
+    /// Renders a bridge error with the documented camelCase keys. Serializing the CLR type directly
+    /// would emit Code/Message/Details and make bridge errors differ from sidecar errors.
+    /// </summary>
+    internal static JObject ErrorObject(RpcError error) => new()
+    {
+        ["code"] = error.Code,
+        ["message"] = error.Message,
+        ["details"] = error.Details?.DeepClone()
     };
 
     public void Dispose()

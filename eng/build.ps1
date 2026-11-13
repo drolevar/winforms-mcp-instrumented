@@ -3,6 +3,9 @@
 param(
     [switch]$SkipWindowsTests,
     [switch]$SkipPack,
+    # Opt-in: launches the demo on the interactive desktop, moves its window, and captures the
+    # screen. Needs Python 3 and a visible desktop, so it is not part of the default workflow.
+    [switch]$DesktopExercise,
     [string]$VersionOverride
 )
 
@@ -12,6 +15,7 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 $solution = Join-Path $repoRoot 'WinFormsMcp.Instrumented.slnx'
 $sample = Join-Path $repoRoot 'samples/InstrumentedDemo/InstrumentedDemo.csproj'
 $protocolTests = Join-Path $repoRoot 'tests/WinFormsMcp.Instrumented.Protocol.Tests/WinFormsMcp.Instrumented.Protocol.Tests.csproj'
+$serverTests = Join-Path $repoRoot 'tests/WinFormsMcp.Instrumented.Server.Tests/WinFormsMcp.Instrumented.Server.Tests.csproj'
 $windowsTests = Join-Path $repoRoot 'tests/WinFormsMcp.Instrumented.Tests/WinFormsMcp.Instrumented.Tests.csproj'
 $validationRoot = Join-Path $repoRoot 'artifacts/validation'
 $packageRoot = Join-Path $repoRoot 'artifacts/packages'
@@ -46,6 +50,7 @@ try {
         '-p:EnableWinFormsMcpInstrumentation=true') + $versionArguments
     Invoke-DotNet -Arguments (@('build', $solution) + $debugArguments)
     Invoke-DotNet -Arguments (@('test', $protocolTests, '--no-build', '--no-restore') + $debugArguments)
+    Invoke-DotNet -Arguments (@('test', $serverTests, '--no-build', '--no-restore') + $debugArguments)
     if ($IsWindows -and -not $SkipWindowsTests) {
         Invoke-DotNet -Arguments (@('test', $windowsTests, '--no-build', '--no-restore') + $debugArguments)
     }
@@ -53,11 +58,27 @@ try {
         Write-Warning 'Windows UI runtime tests were skipped. This build is not Windows runtime verification.'
     }
 
+    if ($DesktopExercise) {
+        if (-not $IsWindows) { throw '-DesktopExercise requires an interactive Windows desktop.' }
+        $debugBin = Join-Path $debugRoot 'bin'
+        & python (Join-Path $PSScriptRoot 'exercise-demo.py') `
+            --captures (Join-Path $validationRoot 'captures') `
+            --report (Join-Path $validationRoot 'exercise-report.json') -- `
+            dotnet (Join-Path $debugBin 'WinFormsMcp.Instrumented.Server/debug/WinFormsMcp.Instrumented.Server.dll') `
+            --app (Join-Path $debugBin 'InstrumentedDemo/debug/InstrumentedDemo.exe')
+        if ($LASTEXITCODE -ne 0) { throw "Desktop exercise reported failures (exit code $LASTEXITCODE)." }
+    }
+
     $strippedRoot = Join-Path $validationRoot 'stripped'
     $releaseArguments = @('-c', 'Release', '--artifacts-path', $strippedRoot,
         '-p:EnableWinFormsMcpInstrumentation=false') + $versionArguments
     Invoke-DotNet -Arguments (@('build', $solution) + $releaseArguments)
     Assert-Stripped $strippedRoot
+    if ($DesktopExercise) {
+        & (Join-Path $PSScriptRoot 'verify-no-endpoint.ps1') `
+            -StrippedExecutable (Join-Path $strippedRoot 'bin/InstrumentedDemo/release/InstrumentedDemo.exe') `
+            -InstrumentedExecutable (Join-Path $debugRoot 'bin/InstrumentedDemo/debug/InstrumentedDemo.exe')
+    }
 
     $instrumentedRoot = Join-Path $validationRoot 'instrumented'
     $instrumentedArguments = @('-c', 'Release', '--artifacts-path', $instrumentedRoot,

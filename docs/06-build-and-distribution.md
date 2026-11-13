@@ -190,6 +190,55 @@ directory. It builds both enabled and disabled variants. This verifies the actua
 conditional `PackageReference` path as well as the sample's `ProjectReference`
 path, without relying on a published NuGet package or altering a customer project.
 
+## Windows host notes found by running the workflow
+
+These came out of the first real Windows run (2026-11-13). Each one makes a
+correct repository look broken, so they are recorded with their causes.
+
+**Scripts from an extracted archive are blocked.** A source archive extracted on
+Windows marks every file with a `Zone.Identifier` stream (Mark-of-the-Web). Under
+the default `RemoteSigned` execution policy, `pwsh -File .\eng\build.ps1` then fails
+with "is not digitally signed". This is a deliberate Windows safeguard, not a
+defect in the script, so the repository neither disables it nor ships a bypass.
+Review the scripts, then either run `Unblock-File` on the `eng` scripts yourself or,
+better, clone the repository with Git: Git-written files carry no mark. Compiling
+with `dotnet` is unaffected.
+
+**A machine-level NuGet source mapping hides the local package feed.** The
+package-consumer check restores from the freshly packed directory. If the user or
+machine `NuGet.Config` defines `packageSourceMapping` (common in managed
+environments, usually `nuget.org` → `*`), NuGet treats every source without a
+mapping as ineligible and fails with `NU1101` even though the local feed has the
+package. The generated consumer configuration therefore clears inherited
+mappings and declares its own: `WinFormsMcp.Instrumented` and
+`WinFormsMcp.Instrumented.*` come only from the local feed, everything else from
+`nuget.org`. The side benefit is intentional: a package ID of ours can never be
+satisfied from the public feed during this check.
+
+**Close the demo before rebuilding.** A running instrumented demo locks its
+copied bridge and protocol assemblies, so a rebuild fails with `MSB3021`/`MSB3027`.
+The sidecar deliberately does not kill the application when MCP closes, so a
+crashed agent session can leave one behind. Use `app_stop`, or stop the process
+by its ID.
+
+## Verification scripts and test projects
+
+| Item | What it establishes | Needs |
+| --- | --- | --- |
+| `tests/WinFormsMcp.Instrumented.Protocol.Tests` | Framing and contract serialization | Any OS |
+| `tests/WinFormsMcp.Instrumented.Server.Tests` | Sidecar contracts that need no app: error shape, option guards | Any OS |
+| `tests/WinFormsMcp.Instrumented.Tests` | Bridge against a real pipe and STA message loop | Windows, net48 |
+| `eng/verify-stripped.ps1` | Files and PE metadata of a stripped build | Any OS with pwsh |
+| `eng/verify-package-consumer.ps1` | Enabled and stripped consumers of the packed packages | Packed packages |
+| `eng/exercise-demo.py` | The whole workflow through the real sidecar and demo, including captures, desktop-edge clipping, modal dialog and restart | Windows, interactive desktop, Python 3 |
+| `eng/verify-no-endpoint.ps1` | Runtime: a stripped build opens no pipe with activation variables set; an instrumented build does | Windows, interactive desktop |
+
+`eng/build.ps1` runs the first five by default. `-DesktopExercise` adds the last
+two. They are opt-in because they open windows, move the demo window across the
+desktop and copy screen pixels; a headless runner cannot honestly run them.
+`exercise-demo.py` writes its screenshots and a JSON report under
+`artifacts/validation/`, and always stops the application it launched.
+
 ## Packing and publishing
 
 Each public package carries MIT license metadata and the package README. Keep

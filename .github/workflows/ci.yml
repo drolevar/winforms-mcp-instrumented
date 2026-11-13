@@ -39,6 +39,10 @@ jobs:
         run: >-
           dotnet test tests/WinFormsMcp.Instrumented.Protocol.Tests/WinFormsMcp.Instrumented.Protocol.Tests.csproj
           -c Release --artifacts-path artifacts/portable
+      - name: Test the MCP sidecar contracts
+        run: >-
+          dotnet test tests/WinFormsMcp.Instrumented.Server.Tests/WinFormsMcp.Instrumented.Server.Tests.csproj
+          -c Release --artifacts-path artifacts/portable
       - name: Build independent MCP server
         run: >-
           dotnet build src/WinFormsMcp.Instrumented.Server/WinFormsMcp.Instrumented.Server.csproj

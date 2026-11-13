@@ -73,6 +73,19 @@ $packageRootXml = [System.Security.SecurityElement]::Escape($packageRoot)
     <add key="built-packages" value="$packageRootXml" />
     <add key="nuget.org" value="https://api.nuget.org/v3/index.json" protocolVersion="3" />
   </packageSources>
+  <!-- A user- or machine-level packageSourceMapping makes every unmapped source ineligible,
+       including this local feed (NU1101). Clear inherited mappings and declare our own: the
+       product packages come only from the local feed, everything else from nuget.org. -->
+  <packageSourceMapping>
+    <clear />
+    <packageSource key="built-packages">
+      <package pattern="WinFormsMcp.Instrumented" />
+      <package pattern="WinFormsMcp.Instrumented.*" />
+    </packageSource>
+    <packageSource key="nuget.org">
+      <package pattern="*" />
+    </packageSource>
+  </packageSourceMapping>
 </configuration>
 "@ | Set-Content -LiteralPath (Join-Path $fixtureRoot 'NuGet.Config') -Encoding utf8
 
