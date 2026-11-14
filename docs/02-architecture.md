@@ -12,7 +12,7 @@ Windows integration tests.
 
 | Component | Responsibility | Reason for the boundary |
 | --- | --- | --- |
-| `WinFormsMcp.Instrumented` | Application integration, UI dispatch, control identity, discovery, adapters, capture, and the pipe endpoint. Targets `net48`. | It is the only component that needs direct access to managed WinForms objects. |
+| `WinFormsMcp.Instrumented` | Application integration, UI dispatch, control and element identity, discovery, control and element adapters (including the built-in `ToolStripAdapter`), capture, and the pipe endpoint. Targets `net48`. | It is the only component that needs direct access to managed WinForms objects. |
 | `WinFormsMcp.Instrumented.Protocol` | Private wire contracts, protocol versioning, limits, and transport framing shared by both sides. Targets `netstandard2.0`. | Both runtimes need a small shared vocabulary without importing the MCP SDK or WinForms types. |
 | `WinFormsMcp.Instrumented.Server` | MCP transport and tools, connection management, result conversion, and configured application lifecycle. Runs on modern .NET. | It owns the agent session and survives the application's lifetime. |
 | Sample application | Demonstrates default integration and deliberately exercises dynamic UI behavior. | It provides a reproducible target without requiring a particular customer application. |
@@ -114,9 +114,21 @@ when handle-related information is actually needed.
 Some UI elements are not `Control` instances. `ToolStripItem` objects, tree
 nodes, list items, and grid cells need adapter-specific descriptions and
 identity rules. Reusing a display index as a permanent identity is particularly
-unsafe after sorting or rebinding. The initial implementation must report its
+unsafe after sorting or rebinding. The implementation must report its
 actual supported element types rather than pretending that recursive
 `Control.Controls` traversal covers them all.
+
+The identity registry is therefore keyed on the observed **object**, not on
+`Control`: a weak reference-identity table maps each object to its id, and each
+entry records the adapter that owns it (none for a plain control), a weak
+observed parent and the weak target. Whoever emits an object first in a walk owns
+it, and the registry classifies an object by that owner, not by its CLR type. An
+element's id follows the same rules as a control's: a moved element keeps its id,
+a replacement gets a new one, a disposed or removed one is `stale_target`. Because
+an element has no `Parent` chain to a form, its validity is checked by asking its
+adapter for its parent and re-listing that parent's children until the chain
+reaches a control, where the ordinary scope check applies. Details and the
+adapter contract are in [element adapters](09-element-adapters.md).
 
 ## Threading and operation completion
 
@@ -155,6 +167,18 @@ Built-in adapters cover a documented set of standard controls. A text adapter
 knows whether a value is editable; a selection adapter knows the available
 items; a grid adapter exposes bounded ranges. A custom adapter is an explicit
 extension point for application-specific controls.
+
+Elements that are not controls have their own seam: the public abstract class
+`ElementAdapter` (namespace `WinFormsMcp.Instrumented.Elements`), registered with
+`McpBridgeBuilder.AddElementAdapter`. An adapter lists the children of a parent,
+describes an element and executes a named action, all on the UI thread, and never
+sees the pipe or the protocol. The bridge validates what an adapter returns,
+bounds its output, and isolates its failures to the affected subtree. The
+built-in `ToolStripAdapter` (menus, toolbars, status strips, context menus) is
+always consulted after the application's adapters. Third-party suites are
+supported by adapters that live in the consuming application, so the public
+packages have no compile-time dependency on any suite. Rows and cells of grids
+are deliberately not elements; see [element adapters](09-element-adapters.md).
 
 Avoid an unrestricted `set_property` or `invoke_method` facility. Reflection
 does not provide a useful behavioral contract and makes accidental application

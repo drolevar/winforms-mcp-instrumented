@@ -272,6 +272,65 @@ namespace WinFormsMcp.Instrumented.Tests
             }
         }
 
+        // --- element adapter registration -------------------------------------------------------
+
+        [TestMethod]
+        public async Task AdapterNamesAreValidatedAndAppearInHello()
+        {
+            foreach (string bad in new[] { "", "Upper", "has space", new string('a', 49), "fake\n", new string('a', 48) + "\n" })
+                Assert.ThrowsExactly<ArgumentException>(() => new NamedAdapter(bad), "Name '" + bad + "' must be rejected.");
+            Assert.ThrowsExactly<ArgumentNullException>(() => new McpBridgeBuilder().AddElementAdapter(null!));
+
+            var builder = new McpBridgeBuilder().AddElementAdapter(new NamedAdapter("same"));
+            Assert.ThrowsExactly<ArgumentException>(() => builder.AddElementAdapter(new NamedAdapter("same")));
+
+            using (var app = StartWithFake(new FakeElementAdapter()))
+            {
+                JToken hello = Success(await app.RequestAsync("hello"));
+                CollectionAssert.AreEqual(new[] { "fake", "toolstrip" }, ((JArray)hello["elementAdapters"]!).Select(n => (string?)n).ToArray());
+            }
+        }
+
+        [TestMethod]
+        public async Task HelloAdvertisesTheAdaptersTheRuntimeFroze()
+        {
+            McpBridgeBuilder? captured = null;
+            var app = new TestApplication(
+                options =>
+                {
+                    captured = options;
+                    options.AddElementAdapter(new FakeElementAdapter());
+                },
+                window => window.Controls.Add(new Control { Name = FakeElementAdapter.HostName }));
+            using (app)
+            {
+                // The runtime copied the list when the bridge started; a later registration changes nothing.
+                captured!.AddElementAdapter(new NamedAdapter("late"));
+                JToken hello = Success(await app.RequestAsync("hello"));
+                CollectionAssert.AreEqual(new[] { "fake", "toolstrip" }, ((JArray)hello["elementAdapters"]!).Select(n => (string?)n).ToArray());
+            }
+        }
+
+        [TestMethod]
+        public void AddActionRejectsOpenAndClose()
+        {
+            var builder = new McpBridgeBuilder();
+            Assert.ThrowsExactly<ArgumentException>(() => builder.AddAction<Button>("open", _ => { }));
+            Assert.ThrowsExactly<ArgumentException>(() => builder.AddAction<Button>("close", _ => { }));
+            builder.AddAction<Button>("custom", _ => { });
+        }
+
+        private sealed class NamedAdapter : WinFormsMcp.Instrumented.Elements.ElementAdapter
+        {
+            internal NamedAdapter(string name) : base(name) { }
+
+            public override void GetChildren(object parent, WinFormsMcp.Instrumented.Elements.ElementSink sink) { }
+
+            public override bool IsAlive(object element) => false;
+
+            public override void Describe(object element, WinFormsMcp.Instrumented.Elements.ElementDescription description) { }
+        }
+
         private static JObject Paging(JToken node, int startIndex, int maxItems)
         {
             JObject parameters = TargetParameters(node);

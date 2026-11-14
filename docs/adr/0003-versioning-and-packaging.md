@@ -81,7 +81,7 @@ Packaging checks must inspect license/readme metadata and dependency boundaries.
 Windows remains necessary for runtime verification of WinForms behavior.
 
 The first draft is an implementation starting point, not a published package or a
-release claim. Detailed commands and the current dependency baseline are in
+release claim (since then, version 0.1.0-alpha.2 has been published to nuget.org). Detailed commands and the current dependency baseline are in
 [Build and distribution](../06-build-and-distribution.md).
 
 ## References

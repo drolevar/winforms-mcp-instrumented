@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Windows.Forms;
+using WinFormsMcp.Instrumented.Elements;
 
 namespace WinFormsMcp.Instrumented;
 
@@ -9,6 +11,7 @@ public sealed class McpBridgeBuilder
 {
     private readonly List<Func<Control, bool>> exclusions = new();
     private readonly Dictionary<string, CustomControlAction> actions = new(StringComparer.Ordinal);
+    private readonly List<ElementAdapter> elementAdapters = new();
 
     /// <summary>Maximum controls visited by one tree or selector request.</summary>
     public int MaxNodes { get; set; } = 2_000;
@@ -31,7 +34,9 @@ public sealed class McpBridgeBuilder
     /// <summary>
     /// Excludes matching controls and their descendants from discovery and actions.
     /// Screen capture is a view of visible pixels and does not redact excluded controls.
-    /// The predicate runs on the registered UI thread.
+    /// The predicate runs on the registered UI thread. It also runs on unparented controls
+    /// that an element adapter reports as elements (for example a ContextMenuStrip), and
+    /// an exception thrown by the predicate hides that element.
     /// </summary>
     public McpBridgeBuilder Exclude(Func<Control, bool> predicate)
     {
@@ -47,11 +52,26 @@ public sealed class McpBridgeBuilder
     public McpBridgeBuilder AddAction<TControl>(string name, Action<TControl> callback)
         where TControl : Control
     {
-        if (string.IsNullOrWhiteSpace(name) || name == "click" || name == "focus")
-            throw new ArgumentException("Choose a nonempty custom action name other than click or focus.", nameof(name));
+        if (string.IsNullOrWhiteSpace(name) || name == "click" || name == "focus" || name == "open" || name == "close")
+            throw new ArgumentException("Choose a nonempty custom action name other than click, focus, open, or close.", nameof(name));
         if (callback == null) throw new ArgumentNullException(nameof(callback));
         if (actions.ContainsKey(name)) throw new ArgumentException("That action is already registered.", nameof(name));
         actions.Add(name, new CustomControlAction(c => c is TControl, c => callback((TControl)c)));
+        return this;
+    }
+
+    /// <summary>
+    /// Registers an adapter that exposes non-control elements (such as menu items) in the tree.
+    /// Adapters are consulted in registration order. The adapter runs on the registered UI thread.
+    /// </summary>
+    public McpBridgeBuilder AddElementAdapter(ElementAdapter adapter)
+    {
+        if (adapter == null) throw new ArgumentNullException(nameof(adapter));
+        if (adapter.Name == ToolStripAdapter.AdapterName)
+            throw new ArgumentException("The adapter name 'toolstrip' is reserved for the built-in ToolStrip adapter.", nameof(adapter));
+        if (elementAdapters.Any(existing => existing.Name == adapter.Name))
+            throw new ArgumentException("An element adapter with that name is already registered.", nameof(adapter));
+        elementAdapters.Add(adapter);
         return this;
     }
 
@@ -63,6 +83,8 @@ public sealed class McpBridgeBuilder
     }
 
     internal IEnumerable<KeyValuePair<string, CustomControlAction>> Actions => actions;
+
+    internal IReadOnlyList<ElementAdapter> ElementAdapters => elementAdapters;
 
     internal bool TryGetAction(string name, out CustomControlAction action)
         => actions.TryGetValue(name, out action!);

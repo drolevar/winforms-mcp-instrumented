@@ -49,6 +49,35 @@ The first draft supports one owning WinForms UI thread per bridge. It must not
 read controls on another UI thread. See the implementation status for the exact
 boundary; additional UI dispatchers require a deliberate extension.
 
+## Menus, element adapters and exclusion
+
+Menu, toolbar, status-strip and context-menu items are discovered automatically
+by the built-in `ToolStripAdapter`; they need no registration. Support for a
+third-party control suite is an `ElementAdapter` that the application registers
+with `McpBridgeBuilder.AddElementAdapter` in the guarded startup branch (see
+[element adapters](09-element-adapters.md)).
+
+- **Exclusion is by an excluded ancestor control only.** The builder's exclusion
+  predicate applies to controls. An element disappears from trees, and its old ids
+  become `stale_target`, when a control above it is excluded. There is no way to
+  hide one menu command or one element while keeping its window instrumented. An
+  application that must not expose a command to an agent should not instrument
+  that window, or should keep the command in a control that it excludes. An
+  element that is itself a control without a parent, such as a
+  `ContextMenuStrip`, is hidden together with its items when the predicate
+  excludes it; a predicate that throws on such a control hides it too.
+- **A source-compiled adapter must be stripped with the rest of the
+  instrumentation.** An adapter delivered as source compiles into the application
+  assembly, so a stripped build contains whatever part of it is not conditional.
+  Put the adapter files and their registration call under the same
+  `WINFORMS_MCP_INSTRUMENTED` condition (or a conditional `Compile` item), and keep
+  the adapter types `internal`. The stripping verifier checks assembly
+  references, dependency assets and configuration; compiled-in source (a helper
+  class that reads a suite's internals, for example) does not appear as an
+  assembly reference, so the verifier cannot show that it was removed. This
+  repository's verifier does not assert that no adapter types are present; an
+  application that ships an adapter should add that check for its own types.
+
 ## Conditional NuGet reference
 
 The sample consumes a project reference for repository development. A packaged

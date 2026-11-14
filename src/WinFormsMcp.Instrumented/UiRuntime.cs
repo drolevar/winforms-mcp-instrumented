@@ -8,12 +8,14 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using Newtonsoft.Json.Linq;
+using WinFormsMcp.Instrumented.Elements;
 
 namespace WinFormsMcp.Instrumented;
 
 internal sealed class UiRuntime : IDisposable
 {
     private const int MaxObservationJsonCharacters = 2 * 1024 * 1024;
+    private const int MaxElementChildren = 1_000;
     internal static readonly string[] Methods =
     {
         "hello", "windows", "tree", "inspect", "invoke", "set_text", "set_value",
@@ -28,10 +30,11 @@ internal sealed class UiRuntime : IDisposable
 
     private readonly string generation;
     private readonly McpBridgeBuilder options;
+    private readonly ElementAdapter[] adapters;
     private readonly Action<string, string> log;
     private readonly Control dispatcher;
-    private readonly ConditionalWeakTable<Control, ElementIdentity> identities = new();
-    private readonly Dictionary<string, WeakReference> elements = new(StringComparer.Ordinal);
+    private readonly ConditionalWeakTable<object, ElementIdentity> identities = new();
+    private readonly Dictionary<string, ElementEntry> elements = new(StringComparer.Ordinal);
     private readonly object actionsLock = new();
     private readonly Dictionary<string, ActionReceipt> actions = new(StringComparer.Ordinal);
     private readonly int owningThreadId;
@@ -41,6 +44,8 @@ internal sealed class UiRuntime : IDisposable
     {
         this.generation = generation;
         this.options = options;
+        // Application adapters are consulted in registration order; the built-in ToolStrip adapter is always last.
+        adapters = options.ElementAdapters.Concat(new ElementAdapter[] { new ToolStripAdapter() }).ToArray();
         this.log = log;
         owningThreadId = Thread.CurrentThread.ManagedThreadId;
         // This private dispatcher deliberately owns a handle before Application.Run starts.
@@ -49,6 +54,9 @@ internal sealed class UiRuntime : IDisposable
         dispatcher.CreateControl();
         _ = dispatcher.Handle;
     }
+
+    /// <summary>The adapters frozen at construction, in consultation order.</summary>
+    internal IEnumerable<string> AdapterNames => adapters.Select(adapter => adapter.Name);
 
     internal Task<JToken> ExecuteAsync(string method, JObject parameters, CancellationToken cancellationToken)
     {
@@ -233,18 +241,29 @@ internal sealed class UiRuntime : IDisposable
         };
     }
 
-    private JObject Tree(JObject parameters)
+    private JObject Tree(JObject parameters, bool includeElements = true)
     {
         int maxNodes = ReadInt(parameters, "maxNodes", options.MaxNodes, 1, options.MaxNodes);
         int maxDepth = ReadInt(parameters, "maxDepth", options.MaxDepth, 0, options.MaxDepth);
         List<Form> windows = GetWindows(out int skipped);
-        IEnumerable<Control> roots = HasValue(parameters, "target") || HasValue(parameters, "selector")
-            ? new[] { Resolve(parameters) }
-            : windows.Cast<Control>();
+        object? target = HasValue(parameters, "target") || HasValue(parameters, "selector")
+            ? parameters["target"] is JObject ? ResolveAny(parameters) : Resolve(parameters)
+            : null;
         var nodes = new JArray();
         bool truncated = false;
         int remaining = MaxObservationJsonCharacters;
-        foreach (Control root in roots) Walk(root, null, 0, maxDepth, maxNodes, nodes, ref truncated, ref remaining);
+        ElementWalk? walk = includeElements ? new ElementWalk() : null;
+        if (target != null && IsElement(target) && walk != null)
+        {
+            // A tree rooted at an element expands its whole subtree, closed dropdowns included.
+            walk.ExpandClosed = true;
+            WalkElementRoot(target, maxDepth, maxNodes, nodes, ref truncated, ref remaining, walk);
+        }
+        else
+        {
+            IEnumerable<Control> roots = target is Control rootControl ? new[] { rootControl } : windows.Cast<Control>();
+            foreach (Control root in roots) Walk(root, null, 0, maxDepth, maxNodes, nodes, ref truncated, ref remaining, walk);
+        }
         return new JObject
         {
             ["generation"] = generation,
@@ -256,7 +275,7 @@ internal sealed class UiRuntime : IDisposable
     }
 
     private void Walk(Control control, string? parentId, int depth, int maxDepth, int maxNodes,
-        JArray nodes, ref bool truncated, ref int remainingCharacters)
+        JArray nodes, ref bool truncated, ref int remainingCharacters, ElementWalk? walk)
     {
         if (control.IsDisposed || control.Disposing || options.IsExcluded(control)) return;
         if (nodes.Count >= maxNodes || remainingCharacters <= 0) { truncated = true; return; }
@@ -267,13 +286,110 @@ internal sealed class UiRuntime : IDisposable
         if (depth >= maxDepth)
         {
             if (control.Controls.Count != 0) truncated = true;
-            return;
         }
-        foreach (Control child in control.Controls)
-            Walk(child, (string?)node["id"], depth + 1, maxDepth, maxNodes, nodes, ref truncated, ref remainingCharacters);
+        else
+        {
+            foreach (Control child in control.Controls)
+                Walk(child, (string?)node["id"], depth + 1, maxDepth, maxNodes, nodes, ref truncated, ref remainingCharacters, walk);
+        }
+        if (walk != null)
+            WalkElementChildren(control, null, node, depth, maxDepth, maxNodes, nodes, ref truncated, ref remainingCharacters, walk);
     }
 
-    private Control Resolve(JObject parameters)
+    // Emits the elements that adapters report under a control (every adapter, in registration order)
+    // or under an element (only the adapter that emitted it). A parent already at the depth limit gets
+    // a zero budget, which emits nothing but still reports whether anything was cut off.
+    private void WalkElementChildren(object parent, ElementAdapter? owner, JObject parentNode, int depth, int maxDepth,
+        int maxNodes, JArray nodes, ref bool truncated, ref int remainingCharacters, ElementWalk walk)
+    {
+        string parentId = (string)parentNode["id"]!;
+        int budget = depth >= maxDepth ? 0 : Math.Min(MaxElementChildren, maxNodes - nodes.Count);
+        var found = new List<KeyValuePair<ElementAdapter, object>>();
+        foreach (ElementAdapter adapter in owner != null ? new[] { owner } : adapters)
+        {
+            if (!CollectElements(adapter, "GetChildren", sink => adapter.GetChildren(parent, sink), ref budget, found, ref truncated))
+                parentNode["childrenError"] = "adapter_failed";
+            if (parent is Form window &&
+                !CollectElements(adapter, "GetWindowRoots", sink => adapter.GetWindowRoots(window, sink), ref budget, found, ref truncated))
+                parentNode["childrenError"] = "adapter_failed";
+        }
+        foreach (KeyValuePair<ElementAdapter, object> pair in found)
+        {
+            if (walk.EmittedUnder.TryGetValue(pair.Value, out string? emittedUnder))
+            {
+                // Already emitted in this response: a duplicate or a cycle. A placement that shares its
+                // child collection with an earlier placement points to that placement instead.
+                if (owner != null && emittedUnder != parentId && !ReferenceEquals(pair.Value, parent)
+                    && parentNode["childrenOf"]!.Type == JTokenType.Null)
+                    parentNode["childrenOf"] = emittedUnder;
+                continue;
+            }
+            WalkElement(pair.Key, pair.Value, parent, parentId, depth + 1, maxDepth, maxNodes, nodes,
+                ref truncated, ref remainingCharacters, walk);
+        }
+    }
+
+    // The root of an element-rooted tree: the element itself at depth 0, hung under its real parent so an
+    // agent can navigate upward. The caller has already resolved the element, so its entry and owner exist.
+    private void WalkElementRoot(object element, int maxDepth, int maxNodes, JArray nodes,
+        ref bool truncated, ref int remainingCharacters, ElementWalk walk)
+    {
+        ElementEntry entry = FindEntry(element)!;
+        object? parent = ParentOf(entry, element);
+        WalkElement(entry.Owner!, element, parent, parent == null ? null : ParentId(parent), 0, maxDepth, maxNodes, nodes,
+            ref truncated, ref remainingCharacters, walk);
+    }
+
+    private bool CollectElements(ElementAdapter adapter, string operation, Action<ElementSink> call, ref int budget,
+        List<KeyValuePair<ElementAdapter, object>> found, ref bool truncated)
+    {
+        var sink = new ElementSink(budget);
+        try { call(sink); }
+        catch (Exception exception)
+        {
+            log("adapter_failed", "Element adapter '" + adapter.Name + "' failed in " + operation + ": " +
+                exception.GetType().Name + ": " + exception.Message);
+            return false;
+        }
+        foreach (object element in sink.Items)
+        {
+            // Controls the bridge walks itself (a form, or any control with a parent) share the control identity
+            // table; an element with such a control's identity would duplicate its id and let the adapter own
+            // (and prune) a live control. An unparented control (a context menu) is never walked and may be an element.
+            if (element is Form || element is Control { Parent: not null })
+            {
+                log("adapter_failed", "Element adapter '" + adapter.Name + "' reported a control as an element in " +
+                    operation + "; it was dropped.");
+                continue;
+            }
+            // An excluded control is hidden like any other excluded control; this is not an adapter failure.
+            if (element is Control excluded && IsExcludedFailClosed(excluded)) continue;
+            found.Add(new KeyValuePair<ElementAdapter, object>(adapter, element));
+        }
+        budget -= sink.Items.Count;
+        if (sink.Overflowed) truncated = true;
+        return true;
+    }
+
+    private void WalkElement(ElementAdapter adapter, object element, object? parent, string? parentId, int depth,
+        int maxDepth, int maxNodes, JArray nodes, ref bool truncated, ref int remainingCharacters, ElementWalk walk)
+    {
+        if (nodes.Count >= maxNodes || remainingCharacters <= 0) { truncated = true; return; }
+        JObject node = DescribeElement(adapter, element, parentId, parent, out ElementDescription? description);
+        remainingCharacters -= node.ToString(Newtonsoft.Json.Formatting.None).Length;
+        if (remainingCharacters < 0) { truncated = true; return; }
+        nodes.Add(node);
+        walk.EmittedUnder[element] = parentId;
+        if (description == null) return;
+        if (!walk.ExpandClosed && description.Opened == false && description.ChildCount > 0)
+        {
+            node["childrenOmitted"] = true;
+            return;
+        }
+        WalkElementChildren(element, adapter, node, depth, maxDepth, maxNodes, nodes, ref truncated, ref remainingCharacters, walk);
+    }
+
+    private object ResolveAny(JObject parameters)
     {
         AssertUiThread();
         if (parameters["target"] is JObject target)
@@ -281,27 +397,49 @@ internal sealed class UiRuntime : IDisposable
             if (RequiredString(target, "generation") != generation)
                 throw new BridgeFailure("stale_generation", "The target belongs to a different application generation.");
             string id = RequiredString(target, "id");
-            if (!elements.TryGetValue(id, out WeakReference? reference) || !(reference.Target is Control control))
+            if (!elements.TryGetValue(id, out ElementEntry? entry) || !(entry.Target.Target is object live))
                 throw new BridgeFailure("stale_target", "The observed control no longer exists.");
-            if (!IsInScope(control))
-                throw new BridgeFailure("stale_target", "The observed control is disposed, detached, or outside the instrumented scope.");
-            return control;
+            if (entry.Owner == null && live is Control control)
+            {
+                if (!IsInScope(control))
+                    throw new BridgeFailure("stale_target", "The observed control is disposed, detached, or outside the instrumented scope.");
+            }
+            else if (!IsElementInScope(entry, live))
+                throw new BridgeFailure("stale_target", "The observed element is gone, detached, or outside the instrumented scope.");
+            return live;
+        }
+        throw new BridgeFailure("invalid_argument", "Supply target { generation, id } or selector { name, type? }.");
+    }
+
+    private Control Resolve(JObject parameters)
+    {
+        AssertUiThread();
+        if (parameters["target"] is JObject)
+        {
+            // The stale check runs first, so a removed element is stale_target, not unsupported.
+            object resolved = ResolveAny(parameters);
+            if (!IsElement(resolved) && resolved is Control control) return control;
+            throw new BridgeFailure("unsupported_operation", "This operation applies to controls, not elements.");
         }
         if (parameters["selector"] is JObject selector)
         {
             string name = RequiredString(selector, "name");
             string? type = OptionalString(selector, "type");
-            JObject tree = Tree(new JObject());
+            JObject tree = Tree(new JObject(), includeElements: false);
             if ((bool)tree["truncated"]!)
                 throw new BridgeFailure("scope_limit", "The control tree was truncated; use a concrete target or increase configured limits.");
             var matches = ((JArray)tree["nodes"]!).OfType<JObject>()
-                .Where(n => elements[(string)n["id"]!].Target is Control candidate && candidate.Name == name
+                .Where(n => elements[(string)n["id"]!].Target.Target is Control candidate && candidate.Name == name
                     && (type == null || candidate.GetType().FullName == type || candidate.GetType().Name == type))
                 .ToList();
             if (matches.Count == 0) throw new BridgeFailure("target_not_found", "No current control matches the selector.");
             if (matches.Count != 1) throw new BridgeFailure("ambiguous_target", "More than one current control matches the selector.");
             string id = (string)matches[0]["id"]!;
-            if (elements[id].Target is Control match && IsInScope(match)) return match;
+            if (elements[id].Target.Target is Control match && IsInScope(match))
+            {
+                if (IsElement(match)) throw new BridgeFailure("unsupported_operation", "This operation applies to controls, not elements.");
+                return match;
+            }
             throw new BridgeFailure("stale_target", "The matching control changed during selection.");
         }
         throw new BridgeFailure("invalid_argument", "Supply target { generation, id } or selector { name, type? }.");
@@ -322,18 +460,120 @@ internal sealed class UiRuntime : IDisposable
         return false;
     }
 
-    private string Identity(Control control)
+    // Doc 09 "Stale detection": the element's adapter says it is alive, its parent still lists it, and the
+    // chain of parents ends in a control that is in scope. Each adapter call is isolated: a failure counts
+    // as "not listed" (the target is reported stale) rather than as an operation failure.
+    private bool IsElementInScope(ElementEntry entry, object element, int depth = 0)
     {
-        ElementIdentity identity = identities.GetValue(control, _ => new ElementIdentity(Guid.NewGuid().ToString("N")));
-        elements[identity.Id] = new WeakReference(control);
+        if (depth > 256 || entry.Owner == null || IsDeadElement(entry, failClosed: true)) return false;
+        // An excluded control that an adapter emitted (a context menu) is out of scope, and so is everything under it.
+        if (element is Control self && IsExcludedFailClosed(self)) return false;
+        object? parent = ParentOf(entry, element);
+        if (parent == null) return false;
+        ElementEntry? parentEntry = FindEntry(parent);
+        // An entry with an owner is an element even when its object is a control (a context menu has no parent).
+        bool controlParent = parent is Control && (parentEntry == null || parentEntry.Owner == null);
+        // Adapters are not called for an excluded, disposed or foreign-thread control.
+        if (controlParent && !IsInScope((Control)parent)) return false;
+        if (!ListsElement(entry.Owner, parent, element)) return false;
+        if (controlParent) return true;
+        return parentEntry != null && IsElementInScope(parentEntry, parent, depth + 1);
+    }
+
+    // A predicate written for parented controls can throw on an unparented one (a context menu);
+    // such a control is treated as excluded rather than failing the request.
+    private bool IsExcludedFailClosed(Control control)
+    {
+        try { return options.IsExcluded(control); }
+        catch (Exception) { return true; }
+    }
+
+    private object? ParentOf(ElementEntry entry, object element)
+    {
+        try
+        {
+            object? parent = entry.Owner?.GetParent(element);
+            if (parent != null) return parent;
+        }
+        catch (Exception exception)
+        {
+            log("adapter_failed", "Element adapter '" + entry.Owner!.Name + "' failed in GetParent: " +
+                exception.GetType().Name + ": " + exception.Message);
+        }
+        return entry.ObservedParent?.Target;
+    }
+
+    private bool ListsElement(ElementAdapter adapter, object parent, object element)
+    {
+        var sink = new ElementSink(options.MaxNodes, element);
+        try
+        {
+            adapter.GetChildren(parent, sink);
+            if (!sink.Found && parent is Form window) adapter.GetWindowRoots(window, sink);
+        }
+        catch (Exception exception)
+        {
+            log("adapter_failed", "Element adapter '" + adapter.Name + "' failed in GetChildren: " +
+                exception.GetType().Name + ": " + exception.Message);
+            return false;
+        }
+        return sink.Found;
+    }
+
+    // Targets are classified by registry ownership, not by type: an owned entry is an element even if it is a Control.
+    private bool IsElement(object target) => FindEntry(target)?.Owner != null;
+
+    private ElementEntry? FindEntry(object element)
+        => identities.TryGetValue(element, out ElementIdentity? identity) && elements.TryGetValue(identity.Id, out ElementEntry? entry)
+            ? entry
+            : null;
+
+    private string? ParentId(object parent)
+        => parent is Control control ? Identity(control)
+            : identities.TryGetValue(parent, out ElementIdentity? identity) ? identity.Id : null;
+
+    private string Identity(object element, ElementAdapter? owner = null, object? parent = null)
+    {
+        ElementIdentity identity = identities.GetValue(element, _ => new ElementIdentity(Guid.NewGuid().ToString("N")));
+        if (!elements.TryGetValue(identity.Id, out ElementEntry? entry))
+            elements[identity.Id] = entry = new ElementEntry(element);
+        entry.Target = new WeakReference(element);
+        if (owner != null) entry.Owner = owner;
+        if (parent != null) entry.ObservedParent = new WeakReference(parent);
         return identity.Id;
     }
 
     private void PruneElements()
     {
-        foreach (string id in elements.Where(pair => !pair.Value.IsAlive ||
-                     pair.Value.Target is Control control && control.IsDisposed).Select(pair => pair.Key).ToArray())
+        foreach (string id in elements.Where(pair => !pair.Value.Target.IsAlive ||
+                     pair.Value.Target.Target is Control control && control.IsDisposed ||
+                     IsDeadElement(pair.Value)).Select(pair => pair.Key).ToArray())
             elements.Remove(id);
+    }
+
+    // A throwing IsAlive counts as alive for pruning (an entry is never dropped on an adapter failure)
+    // and as dead for the stale check (the element is not trusted).
+    private bool IsDeadElement(ElementEntry entry, bool failClosed = false)
+    {
+        if (entry.Owner == null || !(entry.Target.Target is object element)) return false;
+        try { return !entry.Owner.IsAlive(element); }
+        catch (Exception exception)
+        {
+            log("adapter_failed", "Element adapter '" + entry.Owner.Name + "' failed in IsAlive: " +
+                exception.GetType().Name + ": " + exception.Message);
+            return failClosed;
+        }
+    }
+
+    // Once the bridge walks a control it is a control: an adapter that emitted it while it had no parent
+    // no longer owns it.
+    private string ControlIdentity(Control control)
+    {
+        string id = Identity(control);
+        ElementEntry entry = elements[id];
+        entry.Owner = null;
+        entry.ObservedParent = null;
+        return id;
     }
 
     private JObject Describe(Control control, string? parentId)
@@ -356,7 +596,8 @@ internal sealed class UiRuntime : IDisposable
 
         var result = new JObject
         {
-            ["id"] = Identity(control),
+            ["kind"] = "control",
+            ["id"] = ControlIdentity(control),
             ["generation"] = generation,
             ["parentId"] = parentId,
             ["name"] = LimitText(control.Name),
@@ -385,9 +626,74 @@ internal sealed class UiRuntime : IDisposable
         return result;
     }
 
+    private JObject DescribeElement(ElementAdapter adapter, object element, string? parentId, object? parent,
+        out ElementDescription? described)
+    {
+        string id = Identity(element, adapter, parent);
+        var description = new ElementDescription();
+        string? error = null;
+        try
+        {
+            adapter.Describe(element, description);
+            described = description;
+        }
+        catch (Exception exception)
+        {
+            log("adapter_failed", "Element adapter '" + adapter.Name + "' failed in Describe: " +
+                exception.GetType().Name + ": " + exception.Message);
+            // Do not trust a partly filled description.
+            description = new ElementDescription { Enabled = false, Available = false };
+            described = null;
+            error = "adapter_failed";
+        }
+
+        string? name = description.Name;
+        string? text = description.Text;
+        Control? hosted = description.HostedControl;
+        var properties = new JObject();
+        foreach (KeyValuePair<string, string?> property in description.Properties)
+            properties[LimitText(property.Key)] = property.Value == null ? null : LimitText(property.Value);
+        return new JObject
+        {
+            ["kind"] = "item",
+            ["adapter"] = adapter.Name,
+            ["role"] = description.Role,
+            ["id"] = id,
+            ["generation"] = generation,
+            ["parentId"] = parentId,
+            ["name"] = name == null ? null : LimitText(name),
+            ["nameTruncated"] = name != null && name.Length > options.MaxTextLength,
+            ["text"] = text == null ? null : LimitText(text),
+            ["textTruncated"] = text != null && text.Length > options.MaxTextLength,
+            ["type"] = element.GetType().FullName,
+            ["shortType"] = element.GetType().Name,
+            ["enabled"] = description.Enabled,
+            ["available"] = description.Available,
+            ["visible"] = description.Visible,
+            ["checked"] = description.Checked,
+            ["shortcut"] = description.Shortcut == null ? null : LimitText(description.Shortcut),
+            ["opened"] = description.Opened,
+            ["childCount"] = description.ChildCount,
+            ["childrenOmitted"] = false,
+            ["bounds"] = description.ScreenBounds.HasValue ? Bounds(description.ScreenBounds.Value) : null,
+            ["hostedControlId"] = hosted != null && !hosted.IsDisposed && !options.IsExcluded(hosted) ? Identity(hosted) : null,
+            ["childrenOf"] = null,
+            ["properties"] = properties,
+            ["capabilities"] = new JArray(description.Capabilities),
+            ["childrenError"] = error
+        };
+    }
+
     private JObject Inspect(JObject parameters)
     {
-        Control control = Resolve(parameters);
+        object resolved = parameters["target"] is JObject ? ResolveAny(parameters) : Resolve(parameters);
+        if (!(resolved is Control control) || IsElement(resolved))
+        {
+            // An element is described only; its subitems are read with a tree rooted at it.
+            ElementEntry entry = FindEntry(resolved)!;
+            object? parent = ParentOf(entry, resolved);
+            return DescribeElement(entry.Owner!, resolved, parent == null ? null : ParentId(parent), parent, out _);
+        }
         JObject result = Describe(control, control.Parent == null ? null : Identity(control.Parent));
         int maximum = ReadInt(parameters, "maxItems", 100, 1, 100);
         int start = ReadInt(parameters, "startIndex", 0, 0, int.MaxValue);
@@ -522,7 +828,13 @@ internal sealed class UiRuntime : IDisposable
 
     private JToken Mutate(string method, JObject parameters)
     {
-        Control control = Resolve(parameters);
+        // Only invoke accepts an element target; every other mutation is control-only and refuses an element.
+        object target = method == "invoke" && parameters["target"] is JObject ? ResolveAny(parameters) : Resolve(parameters);
+        if (!(target is Control control) || IsElement(target))
+        {
+            if (method != "invoke") throw new BridgeFailure("unsupported_operation", "This operation applies to controls, not elements.");
+            return InvokeElement(FindEntry(target)!, target, parameters);
+        }
         if (!control.Enabled) throw new BridgeFailure("disabled_control", "The target control is disabled.");
         if (!control.Visible && method != "ensure_visible")
             throw new BridgeFailure("hidden_control", "The target control is not visible.");
@@ -539,6 +851,58 @@ internal sealed class UiRuntime : IDisposable
         }
         // A handler can dispose or replace its own control. Do not inspect it afterward.
         return new JObject { ["operation"] = method, ["handlerReturned"] = true };
+    }
+
+    // Doc 09 "Prechecks before Execute": the state is described afresh, then the adapter performs the action.
+    private JToken InvokeElement(ElementEntry entry, object element, JObject parameters)
+    {
+        ElementAdapter adapter = entry.Owner!;
+        object? parent = ParentOf(entry, element);
+        DescribeElement(adapter, element, parent == null ? null : ParentId(parent), parent, out ElementDescription? description);
+        if (description == null)
+            throw new BridgeFailure("operation_failed", "The element could not be described.");
+        string action = OptionalString(parameters, "action") ?? "click";
+        if (!description.Capabilities.Contains(action))
+            throw new BridgeFailure("unsupported_operation", "The element does not support the requested action.");
+        if (!description.Enabled) throw new BridgeFailure("disabled_control", "The target element is disabled.");
+        if (!description.Available) throw new BridgeFailure("hidden_control", "The target element is not available.");
+        if ((action == "open" || action == "close") && !description.Visible)
+            throw new BridgeFailure("not_realized",
+                "The element has no on-screen layout; open its parent menu or show the window first.");
+
+        ElementActionOutcome outcome;
+        try
+        {
+            outcome = adapter.Execute(element, action);
+        }
+        catch (ElementActionException refusal)
+        {
+            throw new BridgeFailure(refusal.Error switch
+            {
+                ElementActionError.Disabled => "disabled_control",
+                ElementActionError.Hidden => "hidden_control",
+                ElementActionError.NotRealized => "not_realized",
+                _ => "unsupported_operation"
+            }, refusal.Message);
+        }
+
+        // A handler can remove or dispose its own element. Describe it again only while it is still in scope,
+        // and report what is observed now, never what was requested.
+        bool? opened = null;
+        if (IsElementInScope(entry, element))
+        {
+            DescribeElement(adapter, element, parent == null ? null : ParentId(parent), parent, out ElementDescription? after);
+            opened = after?.Opened;
+        }
+        var result = new JObject
+        {
+            ["operation"] = "invoke",
+            ["action"] = action,
+            ["handlerReturned"] = true,
+            ["handlerDeferred"] = outcome == ElementActionOutcome.HandlerDeferred
+        };
+        if (opened.HasValue) result["opened"] = opened.Value;
+        return result;
     }
 
     private void Invoke(Control control, JObject parameters)
@@ -907,6 +1271,32 @@ internal sealed class UiRuntime : IDisposable
     {
         internal ElementIdentity(string id) => Id = id;
         internal string Id { get; }
+    }
+
+    private sealed class ElementEntry
+    {
+        internal ElementEntry(object element) => Target = new WeakReference(element);
+        internal WeakReference Target { get; set; }
+        internal WeakReference? ObservedParent { get; set; }
+        // Adapters must not hold elements strongly; the entry must not keep an element alive.
+        internal ElementAdapter? Owner { get; set; }
+    }
+
+    /// <summary>Per-response state of an element walk: each element with the node id it was emitted under.</summary>
+    private sealed class ElementWalk
+    {
+        // The parent id an element was emitted under; null for the root of an element-rooted tree.
+        internal Dictionary<object, string?> EmittedUnder { get; } = new(ReferenceComparer.Instance);
+
+        // True for a tree rooted at an element: closed dropdowns expand instead of collapsing.
+        internal bool ExpandClosed { get; set; }
+    }
+
+    private sealed class ReferenceComparer : IEqualityComparer<object>
+    {
+        internal static readonly ReferenceComparer Instance = new();
+        bool IEqualityComparer<object>.Equals(object? x, object? y) => ReferenceEquals(x, y);
+        int IEqualityComparer<object>.GetHashCode(object obj) => RuntimeHelpers.GetHashCode(obj);
     }
 
     private sealed class ActionReceipt

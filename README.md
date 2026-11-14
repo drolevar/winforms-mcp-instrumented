@@ -34,6 +34,9 @@ from the consuming application's shipping build.
 ## What the draft includes
 
 - Live windows and control-tree inspection, with opaque instance identities.
+- Menu, toolbar, status-strip and context-menu items in the same tree, with
+  click and best-effort open/close through the existing `invoke_control` tool,
+  and a public adapter seam for third-party control suites.
 - Semantic button invocation, focus, text, numeric/date values, checked states,
   selections, scrolling, and bounded DataGridView reads.
 - Dynamic creation, replacement, disposal, and reparenting observed on the next
@@ -47,11 +50,18 @@ from the consuming application's shipping build.
 - A sample app, protocol tests, Windows integration tests, build-exclusion
   checks, actual packed-package consumer checks, and Windows/portable CI.
 
-The current bridge covers **one registered UI thread** and managed `Control`
-instances. ToolStrip items, native common dialogs, hosted foreign UI, and virtual
-elements do not yet have full adapters. Screen capture needs an interactive
-desktop and visible, non-minimized windows; overlapping windows can appear in
-the pixels. See [control behavior](docs/04-controls-and-capture.md).
+The current bridge covers **one registered UI thread**, managed `Control`
+instances, and menu, toolbar, status-strip and context-menu items (`kind: "item"`
+nodes that can be listed, inspected and clicked). Menu `open` is best-effort and
+reports the observed state: in a plain-WinForms measurement (once per condition) a
+dropdown did not stay visible while its window was not active, and that
+inactive-window case has not been run through the bridge. Applications can add
+adapters for third-party control suites. Native common dialogs, hosted foreign
+UI, and virtual elements (grid rows and cells) do not yet have adapters. Popups shown from code and never assigned to a control are
+not discovered, and individual elements cannot be excluded. Screen capture needs
+an interactive desktop and visible, non-minimized windows; overlapping windows can
+appear in the pixels. See [control behavior](docs/04-controls-and-capture.md) and
+[element adapters](docs/09-element-adapters.md).
 
 ## Build and run on Windows
 
@@ -188,6 +198,11 @@ line. A downloaded source archive uses the explicit prerelease fallback
 `0.1.0-alpha.0`, never an invented stable release. The private pipe protocol has
 its own compatibility version.
 
+From the next published version after `0.1.0-alpha.2`, `ElementAdapter` and its
+companion types are public API, and `McpBridgeBuilder.AddAction` reserves the
+action names `open` and `close`: a consumer of `0.1.0-alpha.x` that registered a
+custom action with one of those names must rename it.
+
 `eng/build.ps1` writes local packages under `artifacts/packages`. After building:
 
 ```powershell
@@ -211,6 +226,7 @@ for details and source-archive behavior. Publishing is a separate step.
 | [Build and distribution](docs/06-build-and-distribution.md) | SDK projects, central versions, MinVer, packages, CI |
 | [Implementation status](docs/07-implementation-status.md) | Implemented scope, validation, and next work |
 | [Tool reference](docs/08-mcp-tools.md) | MCP tool arguments and common workflows |
+| [Element adapters](docs/09-element-adapters.md) | Menus, toolbars and third-party elements: seam, identity, measured limits |
 | [Architecture decisions](docs/adr/) | Decision records and consequences |
 
 Coding agents should read [AGENTS.md](AGENTS.md). Claude Code guidance is in

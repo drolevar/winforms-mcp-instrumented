@@ -1,8 +1,11 @@
 using System;
 using System.Linq;
+using System.Reflection;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
+using ModelContextProtocol.Server;
 using Newtonsoft.Json.Linq;
 using WinFormsMcp.Instrumented.Protocol;
+using DescriptionAttribute = System.ComponentModel.DescriptionAttribute;
 
 namespace WinFormsMcp.Instrumented.Server.Tests;
 
@@ -94,5 +97,65 @@ public sealed class ServerContractTests
         Assert.ThrowsExactly<ArgumentException>(() => ServerOptions.Parse(new[] { "--pipe", "p", "--token-env", "PATH", "--", "x" }));
         ServerOptions options = ServerOptions.Parse(new[] { "--app", @"C:\a.exe", "--", "--flag", "value" });
         CollectionAssert.AreEqual(new[] { "--flag", "value" }, options.ApplicationArguments);
+    }
+
+    private static MethodInfo ToolMethod(string toolName) =>
+        typeof(WinFormsTools).GetMethods(BindingFlags.Public | BindingFlags.Instance)
+            .Single(m => m.GetCustomAttribute<McpServerToolAttribute>()?.Name == toolName);
+
+    private static string ToolDescription(string toolName) =>
+        ToolMethod(toolName).GetCustomAttribute<DescriptionAttribute>()!.Description;
+
+    private static string ParameterDescription(string toolName, string parameterName) =>
+        ToolMethod(toolName).GetParameters().Single(p => p.Name == parameterName)
+            .GetCustomAttribute<DescriptionAttribute>()!.Description;
+
+    [TestMethod]
+    public void TheToolSurfaceStillHasNineteenTools()
+    {
+        int count = typeof(WinFormsTools).GetMethods(BindingFlags.Public | BindingFlags.Instance)
+            .Count(m => m.GetCustomAttribute<McpServerToolAttribute>() != null);
+        Assert.AreEqual(19, count);
+    }
+
+    [TestMethod]
+    public void InvokeControlDescribesElementActions()
+    {
+        string description = ToolDescription("invoke_control");
+        string action = ParameterDescription("invoke_control", "action");
+        string both = description + " " + action;
+
+        StringAssert.Contains(both, "element");
+        StringAssert.Contains(action, "open");
+        StringAssert.Contains(action, "close");
+        StringAssert.Contains(both, "observed");
+        StringAssert.Contains(both, "opened");
+        StringAssert.Contains(both, "best-effort");
+        StringAssert.Contains(both, "active window");
+        StringAssert.Contains(both, "semantic click");
+        StringAssert.Contains(both, "closed menu");
+        StringAssert.Contains(both, "SourceControl");
+        StringAssert.Contains(both, "Opening");
+        StringAssert.Contains(both, "not_realized");
+    }
+
+    [TestMethod]
+    public void ControlTreeDescribesItemsAndCollapsedDropdowns()
+    {
+        string description = ToolDescription("control_tree");
+
+        StringAssert.Contains(description, "kind: \"item\"");
+        StringAssert.Contains(description, "childrenOmitted");
+        StringAssert.Contains(description, "closed dropdown");
+        StringAssert.Contains(description, "rooted at the item");
+        StringAssert.Contains(description, "ContextMenuStrip");
+        StringAssert.Contains(description, "not discovered");
+    }
+
+    [TestMethod]
+    public void InspectControlMentionsElementIds()
+    {
+        string description = ToolDescription("inspect_control");
+        StringAssert.Contains(description, "element");
     }
 }

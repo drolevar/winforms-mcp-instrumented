@@ -112,7 +112,11 @@ capture mode (`screen_copy`). It is required before UI operations on each new
 connection, including when the sidecar opens a fresh pipe for every request.
 It also returns `bridgeVersion` and a `limits` object describing the configured
 node, depth, text, image, UI-wait, action and transport bounds. These limits are
-advertised, not negotiated by the caller.
+advertised, not negotiated by the caller. It also returns `elementAdapters`, the
+names of the element adapters in the order they are consulted: the application's
+adapters in registration order, then the built-in `toolstrip`. The `methods` list
+does not change when an adapter is added; adapters change what `tree`, `inspect`
+and `invoke` return, not which methods exist.
 
 Every frame read and write has a 30-second deadline. Expiry disposes the pipe,
 records a bounded transport diagnostic and allows a new connection. A client
@@ -130,9 +134,9 @@ created MCP tools: opening a hundred buttons should not add a hundred tools.
 | --- | --- | --- |
 | `hello` | Protocol version and session credentials | Establish identity, compatibility, and capabilities. |
 | `windows` | None | Current top-level managed windows on the registered UI thread, including modal windows. |
-| `tree` | Optional root, depth and node limits | Bounded live control snapshot and truncation metadata. |
-| `inspect` | Target, optional `startIndex` and `maxItems` | Current properties, actions and bounded choice items/tree paths. |
-| `invoke` | Target | Schedule the adapter's semantic default action. |
+| `tree` | Optional root, depth and node limits | Bounded live control and element snapshot and truncation metadata. |
+| `inspect` | Target, optional `startIndex` and `maxItems` | Current properties, actions and bounded choice items/tree paths; for an element, its description. |
+| `invoke` | Target, optional `action` | Schedule the adapter's semantic default action, or a named action (for an element: `click`, `open`, `close`). |
 | `set_text` | Target, text | Set supported editable text through its adapter. |
 | `set_value` | Target, typed value | Set a supported numeric/date/range value. |
 | `select` | Target, item index; grid row and column; or tree index path | Select a supported item, page, cell, or node. |
@@ -178,6 +182,40 @@ Tree snapshots contain current name, type, text where permitted, visibility,
 enabled state, bounds, parent identity, and supported actions. They are evidence
 at a point in time, not persistent handles to a frozen UI. Resolve and validate
 the target again on its UI thread immediately before an operation.
+
+### Node kinds: controls and elements
+
+Every node has `kind`. A control node has `kind: "control"` and the fields
+above. An element node (a menu, toolbar or status-strip item, a context menu
+strip, or an element supplied by an application adapter) has `kind: "item"` and:
+
+| Field | Meaning |
+| --- | --- |
+| `adapter` | Name of the adapter that owns the element |
+| `role` | Adapter-declared role, `^[a-z_]{1,32}\z` (for example `menu_item`, `context_menu`) |
+| `name`, `text`, `shortcut` | Bounded strings; `text` is null for a host item, whose hosted control carries its own text |
+| `type`, `shortType` | Managed type, filled by the bridge |
+| `enabled`, `available`, `visible` | `visible` is realized on screen now; `available` is configured to show |
+| `checked`, `opened`, `childCount` | Null when not applicable |
+| `childrenOmitted` | True when the children of a closed dropdown were left out of this response |
+| `bounds` | Screen coordinates; null when the element has no on-screen layout |
+| `hostedControlId` | Id of a control hosted by the element, which stays a control node |
+| `childrenOf` | Set when the element's children are listed under another node because several placements share one child collection |
+| `properties` | At most 16 bounded name/value strings |
+| `capabilities` | Actions accepted by `invoke`: `click`, `open`, `close`, or an adapter-declared name |
+| `childrenError` | `adapter_failed` when listing the children failed; that subtree is skipped |
+
+An element target is the same `generation` + `id` pair; the same stale-target
+rule applies, checked by walking up through the element's parents until a control
+is reached. Trees rooted at a window or control omit the children of a closed
+dropdown (`childrenOmitted: true` with `childCount`); a tree rooted at the item
+expands its whole subtree within the depth and node limits. Selectors resolve
+controls only. See [element adapters](09-element-adapters.md).
+
+**Compatibility.** These are additive optional fields plus one error code
+(`not_realized`), so the protocol stays at version 1 and receivers keep ignoring
+unknown optional fields. Nothing was removed or renamed. A consumer that reads
+only control nodes can ignore `kind: "item"` nodes.
 
 ## Actions must not block the next observation
 
@@ -247,6 +285,7 @@ disconnection until another app instance becomes available.
 | `ambiguous_target` | Add a supported type constraint, or inspect the tree and choose a concrete instance ID. |
 | `unsupported_method`, `unsupported_operation` | Use an implemented method and an advertised control capability. |
 | `disabled_control`, `hidden_control`, `read_only`, `focus_failed` | The requested action cannot be applied in the current state. |
+| `not_realized` | An element has no on-screen layout, so `open` or `close` cannot apply; open the parent menu or show the window first. |
 | `capture_unavailable`, `no_windows` | No suitable visible capture target is available. |
 | `capture_limit`, `response_limit`, `scope_limit` | Reduce capture area/page size or adjust documented observation limits. |
 | `ui_changed` | The window collection changed during observation; obtain a fresh snapshot. |

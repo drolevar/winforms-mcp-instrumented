@@ -44,7 +44,7 @@ internal sealed class WinFormsTools(ApplicationSession session)
     public Task<CallToolResult> Windows(CancellationToken cancellationToken) => Call("windows", new JObject(), cancellationToken);
 
     [McpServerTool(Name = "control_tree", ReadOnly = true)]
-    [Description("Inspect the live managed control tree. Optionally restrict it to a previously observed target. Newly created controls appear on the next request; IDs are instance identities, not HWNDs.")]
+    [Description("Inspect the live managed control tree. Optionally restrict it to a previously observed target. Newly created controls appear on the next request; IDs are instance identities, not HWNDs. Items of menus, toolbars, status strips and context menus found through a control's ContextMenuStrip are listed as kind: \"item\" nodes with element ids. Children of closed dropdowns are omitted from window- or control-rooted trees (childrenOmitted, childCount) and are expanded when the tree is rooted at the item. Popups opened from application code and never assigned to a control, such as an unassigned ContextMenuStrip shown with a point, are not discovered.")]
     public Task<CallToolResult> Tree(CancellationToken cancellationToken, string? generation = null, string? id = null,
         int maxDepth = 8, int maxNodes = 1000)
     {
@@ -59,7 +59,7 @@ internal sealed class WinFormsTools(ApplicationSession session)
     }
 
     [McpServerTool(Name = "inspect_control", ReadOnly = true)]
-    [Description("Read current control state, capabilities, and bounded choice items or tree paths. startIndex/maxItems page the current item view. Item positions may change; stale control IDs fail explicitly.")]
+    [Description("Read current control state, capabilities, and bounded choice items or tree paths. startIndex/maxItems page the current item view. Item positions may change; stale control IDs fail explicitly. Also accepts the ids of element nodes (kind: \"item\") such as menu and toolbar items.")]
     public Task<CallToolResult> Inspect(string generation, string id, CancellationToken cancellationToken,
         int startIndex = 0, int maxItems = 100)
     {
@@ -70,9 +70,9 @@ internal sealed class WinFormsTools(ApplicationSession session)
     }
 
     [McpServerTool(Name = "invoke_control")]
-    [Description("Queue a semantic control action such as click or focus. This is a managed action, not a physical mouse gesture. Returns an actionId immediately; poll action_status and inspect dialogs while it runs.")]
+    [Description("Queue a semantic control action such as click or focus. This is a managed action, not a physical mouse gesture. Returns an actionId immediately; poll action_status and inspect dialogs while it runs. Also works on element nodes such as menu and toolbar items. A click on an item inside a closed menu is a semantic click and may run handlers that assume the menu is open. Items in a context menu are clicked with Control.SourceControl unset and without the Opening event (the strip was never shown), so handlers that remember a target in Opening or MouseDown can act on stale state. Error not_realized means the element has no on-screen layout.")]
     public Task<CallToolResult> Invoke(string generation, string id, CancellationToken cancellationToken,
-        [Description("An action supported by the control, normally click or focus.")] string action = "click") =>
+        [Description("An action supported by the control, normally click or focus. On menu-like elements, open and close are also available and report the observed state (opened), not the requested one. open is best-effort: a dropdown generally does not stay visible while the application window is not the active window.")] string action = "click") =>
         Call("invoke", WithTarget(generation, id, "action", action), cancellationToken);
 
     [McpServerTool(Name = "set_text")]

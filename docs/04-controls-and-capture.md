@@ -102,19 +102,52 @@ without inventing an action for every class.
 | `ScrollableControl` | Scroll the viewport and reveal a descendant. |
 | `DataGridView` | Paged visible/model row reads, selection, supported scrolling. |
 | `TreeView`, `ListView` | Adapter-defined item identities, expansion/selection/visibility. |
-| `ToolStrip` items | Adapter-defined logical children and invocation. |
+| `ToolStrip` items (menus, toolbars, status strips, context menus) | **Implemented** by the built-in `ToolStripAdapter`: element nodes with logical children, `click`, and best-effort `open`/`close`; see [element adapters](09-element-adapters.md). |
 | Owner-drawn / third-party controls | General inspection plus explicit custom adapter. |
 
 This table is a target matrix, not a promise that all entries are implemented in
-the first draft. An unsupported operation returns an explicit error. Reflection
-must not be used to call arbitrary private methods, set arbitrary properties, or
-expose entire data-binding objects as a generic escape hatch.
+the first draft; entries marked implemented are. An unsupported operation returns
+an explicit error. Reflection must not be used to call arbitrary private methods,
+set arbitrary properties, or expose entire data-binding objects as a generic
+escape hatch.
 
 Not every UI element is a `Control`. A `ToolStripItem`, grid cell, list item, or
 tree node needs an adapter-owned logical identity. A row index is a temporary
 position in a potentially sorted or virtualized view, not a durable row key.
 Start with honest bounded support; add adapter-specific freshness tokens or
 stable keys before promising robust targeting of virtual items.
+
+### Elements that are not controls
+
+Menu, toolbar and status-strip items, and context menus, are implemented as
+element nodes (`kind: "item"`). Their identity rules extend the table above:
+
+| UI change | Identity rule |
+| --- | --- |
+| Item is added | New instance ID. |
+| Item moves to another strip or menu (same object) | Preserve the ID once the tree has been read again. |
+| Item is removed but alive | Untargetable (`stale_target`); regains the same ID if re-added. |
+| Item, its strip or its form is disposed | `stale_target`. |
+| Another item replaces it with the same `Name` | Different ID; the old one stays stale. |
+| The item's strip is under an excluded control | Absent from trees; old IDs `stale_target`. |
+
+Validity is checked by asking the adapter for the item's parent and re-listing
+that parent's children until the chain reaches a control; a position, text or
+`Name` never identifies an item. Element IDs go stale more often than control
+IDs, and the contract is to fail with `stale_target`, not to retarget. An
+element is hidden only when an ancestor control is excluded; there is no
+per-element exclusion. A `ContextMenuStrip` has no parent, so it is reached
+through the `ContextMenuStrip` property of a visited control.
+
+Actions on items are semantic like those on controls: `click` is `PerformClick`
+(a split button clicks through `PerformButtonClick`) and runs the handler even
+when its menu is closed, so a handler that assumes an open menu may misbehave.
+`open` and `close` show and hide a dropdown and report the state observed
+afterwards; they are best-effort because in a plain-WinForms spike (measured once per
+condition) a dropdown did not stay visible while its window was not the active
+window; that case was not executed through the bridge. The bridge does not
+activate or focus a window to make a menu stay open. The adapter contract, the
+spike and its limits are in [element adapters](09-element-adapters.md).
 
 ### Revealing a control: select tabs first, then scroll
 

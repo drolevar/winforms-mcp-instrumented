@@ -231,6 +231,80 @@ def exercise(client: Any, report: Report, captures: pathlib.Path) -> None:
     report.check("set_text on a password box is accepted but value stays redacted",
                  r["state"] == "completed" and s.inspect("txtPassword")["text"] is None, r)
 
+    # --- menus and context menus (element nodes) ---------------------------
+    def subtree(root: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        # Elements inside a closed dropdown are omitted from window-rooted trees; a tree rooted at the
+        # element expands its subtree without opening anything.
+        tree = tools.result("control_tree", generation=root["generation"], id=root["id"])
+        return {n["name"]: n for n in tree["nodes"] if n["name"]}
+
+    def act_on(node: dict[str, Any], **arguments: Any) -> dict[str, Any]:
+        return s.wait(tools.result("invoke_control", generation=node["generation"], id=node["id"], **arguments))
+
+    menu_bar = s.node("mainMenu")
+    file_item = s.nodes.get("mnuFile", {})
+    report.check("the menu strip is a control node and its File item an element node under it",
+                 menu_bar.get("kind") == "control" and file_item.get("kind") == "item"
+                 and file_item.get("parentId") == menu_bar["id"] and file_item.get("text") == "File"
+                 and file_item.get("role") == "menu_item", [menu_bar, file_item])
+    report.check("a closed dropdown reports its child count and omits its children from the window tree",
+                 file_item.get("opened") is False and file_item.get("childCount") == 2
+                 and file_item.get("childrenOmitted") is True and "mnuExport" not in s.nodes, file_item)
+    file_tree = subtree(file_item)
+    export_item, csv_item, disabled_item = (file_tree.get(n, {}) for n in ("mnuExport", "mnuCsv", "mnuDisabled"))
+    report.check("a tree rooted at mnuFile lists File > Export > CSV as element nodes with the parent chain",
+                 export_item.get("kind") == "item" and csv_item.get("kind") == "item"
+                 and export_item.get("parentId") == file_item["id"] and csv_item.get("parentId") == export_item.get("id")
+                 and disabled_item.get("parentId") == file_item["id"], file_tree)
+    report.check("element nodes carry the item state and capabilities",
+                 csv_item.get("text") == "CSV" and csv_item.get("enabled") is True and "click" in csv_item.get("capabilities", [])
+                 and disabled_item.get("enabled") is False and "open" in export_item.get("capabilities", []), file_tree)
+    report.check("reading the subitems did not open the menu",
+                 s.inspect("mnuFile")["opened"] is False and s.nodes["mnuFile"]["opened"] is False)
+
+    r = act_on(csv_item)
+    report.check("invoke_control click on an element completes with a handler receipt",
+                 r["state"] == "completed" and r["result"].get("action") == "click" and r["result"].get("handlerReturned") is True, r)
+    report.check("the menu item's click handler changed application state", s.node("lblStatus")["text"] == "CSV exported", s.nodes["lblStatus"])
+
+    r = act_on(s.node("btnGreet"))
+    report.check("the status label was reset by an unrelated handler", s.node("lblStatus")["text"] == "Hello, Ada!", s.nodes["lblStatus"])
+    r = act_on(disabled_item)
+    report.check("click on a disabled menu item fails with disabled_control and runs no handler",
+                 r["state"] == "failed" and r["error"]["code"] == "disabled_control"
+                 and s.node("lblStatus")["text"] == "Hello, Ada!", r)
+
+    # open is best-effort: in the plain-WinForms spike a dropdown did not remain visible while its form was
+    # not the active window (docs/09-element-adapters.md), so only the observed state is asserted.
+    r = act_on(file_item, action="open")
+    opened_now = s.inspect("mnuFile")["opened"]
+    report.notes["menuOpenObservedOpened"] = r["result"].get("opened")
+    report.check("open completes and its receipt reports the observed state, equal to a fresh inspect",
+                 r["state"] == "completed" and isinstance(r["result"].get("opened"), bool)
+                 and r["result"]["opened"] == opened_now, [r, opened_now])
+    after_open = subtree(s.node("mnuFile"))
+    report.check("subitems stay readable after open, whichever state was observed",
+                 all(n in after_open for n in ("mnuExport", "mnuCsv", "mnuDisabled")), after_open)
+    r = act_on(s.node("mnuFile"), action="close")
+    report.check("close completes and the dropdown is observed closed",
+                 r["state"] == "completed" and r["result"].get("opened") is False and s.inspect("mnuFile")["opened"] is False, r)
+
+    panel_tree = tools.result("control_tree", generation=s.nodes["standardPanel"]["generation"], id=s.nodes["standardPanel"]["id"])
+    panel_nodes = {n["name"]: n for n in panel_tree["nodes"] if n["name"]}
+    context = panel_nodes.get("ctxDemo", {})
+    report.check("the panel's ContextMenuStrip is reached through the panel, closed, with its child count",
+                 context.get("kind") == "item" and context.get("role") == "context_menu"
+                 and context.get("parentId") == s.nodes["standardPanel"]["id"]
+                 and context.get("opened") is False and context.get("childCount") == 1 and context.get("childrenOmitted") is True,
+                 [{k: n.get(k) for k in ("name", "kind", "role", "parentId", "id", "opened", "childCount", "childrenOmitted")}
+                  for n in panel_tree["nodes"] if n["kind"] == "item"])
+    about = subtree(context).get("ctxAbout", {})
+    report.check("a tree rooted at the context menu lists its item beneath it",
+                 about.get("kind") == "item" and about.get("parentId") == context.get("id") and about.get("text") == "About this panel", about)
+    r = act_on(about)
+    report.check("clicking the context menu item ran its handler", r["state"] == "completed"
+                 and s.node("lblStatus")["text"] == "About clicked", [r, s.nodes["lblStatus"]])
+
     # --- tabs, grid, tree, scrolling --------------------------------------
     r = s.act("select_control", "mainTabs", index=2)
     report.check("select tab page", r["state"] == "completed" and s.inspect("mainTabs")["selectedIndex"] == 2, r)

@@ -21,9 +21,9 @@ can have effects beyond its visual state.
 | `app_restart` | `force=false` | Stop and relaunch without restarting MCP |
 | `app_logs` | `limit=50` | Last 1–200 retained lifecycle/stdout/stderr entries |
 | `list_windows` | — | Current managed windows and IDs |
-| `control_tree` | optional `generation`, `id`; `maxDepth=8`, `maxNodes=1000` | Flat current tree, bounded and explicitly truncated when necessary |
-| `inspect_control` | `generation`, `id`, `startIndex=0`, `maxItems=100` | State, capabilities and bounded current choice items/tree paths |
-| `invoke_control` | `generation`, `id`, `action="click"` | Semantic click/focus or a configured custom action |
+| `control_tree` | optional `generation`, `id`; `maxDepth=8`, `maxNodes=1000` | Flat current tree of controls and elements (`kind`), bounded and explicitly truncated when necessary; see [menus and other elements](#menus-toolbars-and-other-elements) |
+| `inspect_control` | `generation`, `id`, `startIndex=0`, `maxItems=100` | State, capabilities and bounded current choice items/tree paths; for an element node, its description |
+| `invoke_control` | `generation`, `id`, `action="click"` | Semantic click/focus or a configured custom action; on an element, `click`, `open` or `close` |
 | `set_text` | `generation`, `id`, `text` | Editable text assignment |
 | `set_value` | `generation`, `id`, `value` | Numeric value or ISO date string for a supported control |
 | `set_checked` | `generation`, `id`, `value` | Boolean state for check/radio controls |
@@ -78,6 +78,62 @@ application formatting. It does not expose the entire bound data source.
 Text assignment raises normal control change behavior but does not generate a
 sequence of physical keystrokes. Custom actions are named callbacks registered
 by the application; there is no unrestricted reflection or code-evaluation tool.
+
+## Menus, toolbars and other elements
+
+No tool was added for menus: the tool count is still 19. Elements that are not
+controls appear in `control_tree` as nodes with `kind: "item"` and the same
+`generation` + `id` pair. The built-in adapter covers menu strips, tool strips,
+status strips and context menus reached through a control's `ContextMenuStrip`;
+an application can register adapters for other suites (see
+[element adapters](09-element-adapters.md)).
+
+- **Reading a menu without opening it.** The tree lists a menu's subitems with
+  `visible: false` (not realized on screen) and `available: true` (configured to
+  show). A tree rooted at a window or control **omits the children of a closed
+  dropdown**: the item reports `childrenOmitted: true` and its `childCount`. Call
+  `control_tree` with the item's `generation` and `id` to read its subtree; a tree
+  rooted at an item expands all nested dropdowns, within `maxDepth` and `maxNodes`
+  counted from that item. Reading does not open the menu.
+- **`inspect_control`** accepts an element id and returns its description (role,
+  text, enabled, available, checked, shortcut, `opened`, `childCount`, bounds when
+  shown, capabilities). Selectors and the control-only tools (`set_text`,
+  `set_value`, `set_checked`, `select_control`, `scroll_control`,
+  `ensure_visible`, `read_grid`, `capture`) do not apply to an element and answer
+  `unsupported_operation` after the stale-target check.
+- **`invoke_control` with `action="click"`** runs the item's click semantically
+  even when its menu is closed. Prechecks: an action the element does not declare
+  is `unsupported_operation`, a disabled item `disabled_control`, an item whose
+  `available` is false `hidden_control`. A click handler can open a modal dialog,
+  so the receipt follows the usual queued/started/completed lifecycle. The result
+  is `{operation, action, handlerReturned, handlerDeferred}`; `handlerDeferred`
+  is true only when an adapter says the framework postponed the handler (the
+  built-in adapter never does). A click on an item that has a dropdown also
+  carries `opened`, read after the call, like `open` and `close`. A handler may
+  assume the menu is open, which a semantic click does not guarantee. Items in a
+  context menu are clicked with `Control.SourceControl` unset and without the
+  `Opening` event (the strip was never shown), so handlers that remember a target
+  in `Opening` or `MouseDown` can act on stale state.
+- **`invoke_control` with `action="open"` or `"close"`** shows or hides a dropdown.
+  On an element with no on-screen layout (`visible: false`, for example a nested
+  item whose parent menu is closed) it fails with `not_realized`: open the parent
+  menu or show the window first. The result also carries `opened`, read right after
+  the call returns. It is the observed state, not the requested one, and it does
+  not promise the menu is still open later. **`open` is best-effort**: in a
+  plain-WinForms spike (measured once per condition, not through the bridge) a
+  dropdown did not remain visible while its window was not the active window, so
+  in a background application `opened` can be `false` although the
+  call succeeded. The bridge does not activate or focus the window; check
+  `opened` instead of assuming the menu is open.
+- **Element ids go stale more often than control ids.** Removing, disposing or
+  replacing an item, its strip or its form gives `stale_target`; read the tree
+  again.
+- **Not discovered or not supported:** popups shown from code and never assigned
+  to a control (for example `ContextMenuStrip.Show(point)` on an unassigned
+  instance); per-element exclusion (a control that is itself an element, such as a
+  context menu strip, is hidden with its items when the exclusion predicate matches
+  it); rows, cells and other virtualized items. See
+  [implementation status](07-implementation-status.md#current-limitations).
 
 ## Capture
 

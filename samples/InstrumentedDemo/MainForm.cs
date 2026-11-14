@@ -30,6 +30,25 @@ internal sealed class MainForm : Form
         var footer = new Panel { Name = "statusPanel", Dock = DockStyle.Bottom, Height = 42 };
         footer.Controls.Add(_status);
         Controls.Add(footer);
+        // Added last so that docking gives the menu the top edge and the tab control the remainder.
+        MenuStrip menu = MainMenu();
+        MainMenuStrip = menu;
+        Controls.Add(menu);
+    }
+
+    private MenuStrip MainMenu()
+    {
+        var menu = new MenuStrip { Name = "mainMenu" };
+        var csv = new ToolStripMenuItem("CSV") { Name = "mnuCsv" };
+        csv.Click += (_, _) => _status.Text = "CSV exported";
+        var export = new ToolStripMenuItem("Export") { Name = "mnuExport" };
+        export.DropDownItems.Add(csv);
+        var disabled = new ToolStripMenuItem("Disabled command") { Name = "mnuDisabled", Enabled = false };
+        var file = new ToolStripMenuItem("File") { Name = "mnuFile" };
+        file.DropDownItems.Add(export);
+        file.DropDownItems.Add(disabled);
+        menu.Items.Add(file);
+        return menu;
     }
 
     private TabPage StandardControls()
@@ -38,6 +57,12 @@ internal sealed class MainForm : Form
         FlowLayoutPanel panel = Panel("standardPanel");
         panel.Dock = DockStyle.Fill;
         page.Controls.Add(panel);
+        // A context menu reached through the panel's ContextMenuStrip property, closed until the user right-clicks.
+        var context = new ContextMenuStrip { Name = "ctxDemo" };
+        var about = new ToolStripMenuItem("About this panel") { Name = "ctxAbout" };
+        about.Click += (_, _) => _status.Text = "About clicked";
+        context.Items.Add(about);
+        panel.ContextMenuStrip = context;
         panel.Controls.Add(Note("Inspect this tree, set a value, and invoke a button. Controls need no individual registration."));
         var text = new TextBox { Name = "txtName", Text = "World", Width = 240 };
         panel.Controls.Add(text);

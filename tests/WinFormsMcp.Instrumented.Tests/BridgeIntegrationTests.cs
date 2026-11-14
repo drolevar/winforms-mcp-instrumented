@@ -209,8 +209,13 @@ namespace WinFormsMcp.Instrumented.Tests
             private int requestId;
             private int disposed;
 
-            internal TestApplication()
+            private readonly Action<McpBridgeBuilder>? configure;
+            private readonly Action<Form>? populate;
+
+            internal TestApplication(Action<McpBridgeBuilder>? configure = null, Action<Form>? populate = null)
             {
+                this.configure = configure;
+                this.populate = populate;
                 PipeName = "WinFormsMcp.Tests." + Guid.NewGuid().ToString("N");
                 oldPipe = Environment.GetEnvironmentVariable(BridgeProtocol.EnvironmentPipeName);
                 oldToken = Environment.GetEnvironmentVariable(BridgeProtocol.EnvironmentToken);
@@ -245,6 +250,7 @@ namespace WinFormsMcp.Instrumented.Tests
                     {
                         options.UiRequestTimeout = TimeSpan.FromSeconds(3);
                         options.Exclude(control => control.Name == "Excluded");
+                        configure?.Invoke(options);
                     }))
                     using (var window = new Form { Name = "TestWindow", Text = "WinForms MCP tests", Width = 500, Height = 400 })
                     {
@@ -302,6 +308,7 @@ namespace WinFormsMcp.Instrumented.Tests
                         var excluded = new Panel { Name = "Excluded", Top = 290, Left = 0, Width = 100, Height = 50 };
                         excluded.Controls.Add(new TextBox { Name = "InsideExcluded" });
                         window.Controls.Add(excluded);
+                        populate?.Invoke(window);
                         window.Shown += (_, __) => ready.Set();
                         Application.Run(window);
                     }

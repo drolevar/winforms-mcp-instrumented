@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.Pipes;
+using System.Linq;
 using System.Reflection;
 using System.Security.AccessControl;
 using System.Security.Principal;
@@ -204,6 +205,7 @@ internal sealed class BridgeHost : IDisposable
                 ["uiThreadCoverage"] = "registered-thread-only",
                 ["captureMode"] = "screen_copy",
                 ["methods"] = new JArray(UiRuntime.Methods),
+                ["elementAdapters"] = new JArray(ui.AdapterNames),
                 ["limits"] = new JObject
                 {
                     ["maxFrameBytes"] = BridgeProtocol.MaxFrameBytes,
