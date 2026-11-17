@@ -9,6 +9,7 @@ using System.Threading.Tasks;
 using System.Windows.Forms;
 using Newtonsoft.Json.Linq;
 using WinFormsMcp.Instrumented.Elements;
+using WinFormsMcp.Instrumented.Grids;
 
 namespace WinFormsMcp.Instrumented;
 
@@ -19,18 +20,21 @@ internal sealed class UiRuntime : IDisposable
     internal static readonly string[] Methods =
     {
         "hello", "windows", "tree", "inspect", "invoke", "set_text", "set_value",
-        "select", "set_checked", "scroll", "ensure_visible", "read_grid", "capture",
+        "select", "set_checked", "scroll", "ensure_visible", "set_cell", "read_grid", "capture",
         "action_status", "diagnostics"
     };
 
     private static readonly HashSet<string> Mutations = new(StringComparer.Ordinal)
     {
-        "invoke", "set_text", "set_value", "select", "set_checked", "scroll", "ensure_visible"
+        "invoke", "set_text", "set_value", "select", "set_checked", "scroll", "ensure_visible", "set_cell"
     };
 
     private readonly string generation;
     private readonly McpBridgeBuilder options;
     private readonly ElementAdapter[] adapters;
+    private readonly GridAdapter[] gridAdapters;
+    private readonly GridHost grids;
+    private readonly HashSet<string> failedActionPredicates = new(StringComparer.Ordinal);
     private readonly Action<string, string> log;
     private readonly Control dispatcher;
     private readonly ConditionalWeakTable<object, ElementIdentity> identities = new();
@@ -46,6 +50,8 @@ internal sealed class UiRuntime : IDisposable
         this.options = options;
         // Application adapters are consulted in registration order; the built-in ToolStrip adapter is always last.
         adapters = options.ElementAdapters.Concat(new ElementAdapter[] { new ToolStripAdapter() }).ToArray();
+        gridAdapters = options.GridAdapters.ToArray();
+        grids = new GridHost(gridAdapters, log);
         this.log = log;
         owningThreadId = Thread.CurrentThread.ManagedThreadId;
         // This private dispatcher deliberately owns a handle before Application.Run starts.
@@ -57,6 +63,9 @@ internal sealed class UiRuntime : IDisposable
 
     /// <summary>The adapters frozen at construction, in consultation order.</summary>
     internal IEnumerable<string> AdapterNames => adapters.Select(adapter => adapter.Name);
+
+    /// <summary>The grid adapters frozen at construction, in consultation order, then the built-in handling.</summary>
+    internal IEnumerable<string> GridAdapterNames => gridAdapters.Select(adapter => adapter.Name).Concat(new[] { GridAdapter.DataGridViewName });
 
     internal Task<JToken> ExecuteAsync(string method, JObject parameters, CancellationToken cancellationToken)
     {
@@ -152,9 +161,11 @@ internal sealed class UiRuntime : IDisposable
                 catch (Exception exception)
                 {
                     var error = BridgeFailure.Describe(exception);
+                    var failure = new JObject { ["code"] = error.Code, ["message"] = error.Message };
+                    if (error.Details != null) failure["details"] = error.Details.DeepClone();
                     lock (actionsLock)
                     {
-                        receipt.Error = new JObject { ["code"] = error.Code, ["message"] = error.Message };
+                        receipt.Error = failure;
                         receipt.State = "failed";
                         receipt.CompletedUtc = DateTimeOffset.UtcNow;
                     }
@@ -262,7 +273,8 @@ internal sealed class UiRuntime : IDisposable
         else
         {
             IEnumerable<Control> roots = target is Control rootControl ? new[] { rootControl } : windows.Cast<Control>();
-            foreach (Control root in roots) Walk(root, null, 0, maxDepth, maxNodes, nodes, ref truncated, ref remaining, walk);
+            var gridRedaction = new Dictionary<Control, bool>();
+            foreach (Control root in roots) Walk(root, null, 0, maxDepth, maxNodes, nodes, ref truncated, ref remaining, walk, gridRedaction);
         }
         return new JObject
         {
@@ -275,11 +287,12 @@ internal sealed class UiRuntime : IDisposable
     }
 
     private void Walk(Control control, string? parentId, int depth, int maxDepth, int maxNodes,
-        JArray nodes, ref bool truncated, ref int remainingCharacters, ElementWalk? walk)
+        JArray nodes, ref bool truncated, ref int remainingCharacters, ElementWalk? walk,
+        Dictionary<Control, bool> gridRedaction)
     {
         if (control.IsDisposed || control.Disposing || options.IsExcluded(control)) return;
         if (nodes.Count >= maxNodes || remainingCharacters <= 0) { truncated = true; return; }
-        JObject node = Describe(control, parentId);
+        JObject node = Describe(control, parentId, gridRedaction);
         remainingCharacters -= node.ToString(Newtonsoft.Json.Formatting.None).Length;
         if (remainingCharacters < 0) { truncated = true; return; }
         nodes.Add(node);
@@ -290,7 +303,7 @@ internal sealed class UiRuntime : IDisposable
         else
         {
             foreach (Control child in control.Controls)
-                Walk(child, (string?)node["id"], depth + 1, maxDepth, maxNodes, nodes, ref truncated, ref remainingCharacters, walk);
+                Walk(child, (string?)node["id"], depth + 1, maxDepth, maxNodes, nodes, ref truncated, ref remainingCharacters, walk, gridRedaction);
         }
         if (walk != null)
             WalkElementChildren(control, null, node, depth, maxDepth, maxNodes, nodes, ref truncated, ref remainingCharacters, walk);
@@ -576,9 +589,14 @@ internal sealed class UiRuntime : IDisposable
         return id;
     }
 
-    private JObject Describe(Control control, string? parentId)
+    // gridRedaction caches, for one walk, whether a grid an adapter handles has a redacted column.
+    private JObject Describe(Control control, string? parentId, Dictionary<Control, bool>? gridRedaction = null)
     {
+        // A password box hides its text; so does any control inside a grid with a redacted column (a hosted cell editor
+        // can hold that column's text, and keeps it after it is hidden), together with its value, selection and check state.
         bool redacted = IsPassword(control);
+        bool inRedactedGrid = grids.IsInsideRedactedGrid(control, gridRedaction);
+        redacted |= inRedactedGrid;
         string? text = redacted ? null : control.Text;
         var capabilities = new JArray("inspect", "capture", "focus", "ensure_visible");
         if (control is Button) capabilities.Add("click");
@@ -586,13 +604,34 @@ internal sealed class UiRuntime : IDisposable
             capabilities.Add("set_text");
         if (control is CheckBox || control is RadioButton) capabilities.Add("set_checked");
         if (control is NumericUpDown || control is TrackBar || control is DateTimePicker) capabilities.Add("set_value");
-        if (control is ListBox || control is ComboBox || control is ListView || control is TabControl || control is TreeView || control is DataGridView)
+        // An application grid adapter handles a control before the built-in handling does, for select and scroll too
+        // (Mutate routes them to the adapter), so its features alone decide what is advertised for such a control.
+        GridAdapter? gridAdapter = grids.AdapterFor(control);
+        bool builtInGrid = gridAdapter == null && control is DataGridView;
+        if (gridAdapter == null &&
+            (control is ListBox || control is ComboBox || control is ListView || control is TabControl || control is TreeView || builtInGrid))
             capabilities.Add("select");
-        if (control is ScrollableControl scroll && scroll.AutoScroll || control is DataGridView || control is ListBox || control is ListView)
+        if (gridAdapter == null &&
+            (control is ScrollableControl scroll && scroll.AutoScroll || builtInGrid || control is ListBox || control is ListView))
             capabilities.Add("scroll");
-        if (control is DataGridView) capabilities.Add("read_grid");
+        if (builtInGrid) capabilities.Add("read_grid");
+        string? gridName = builtInGrid ? GridAdapter.DataGridViewName : null;
+        string? gridError = null;
+        if (gridAdapter != null)
+        {
+            GridFeatures? features = grids.Features(control);
+            if (features == null) gridError = "adapter_failed";
+            else
+            {
+                gridName = gridAdapter.Name;
+                AddUnique(capabilities, "read_grid");
+                if (features.Value.HasFlag(GridFeatures.Select)) AddUnique(capabilities, "select");
+                if (features.Value.HasFlag(GridFeatures.Scroll)) AddUnique(capabilities, "scroll");
+                if (features.Value.HasFlag(GridFeatures.Edit)) AddUnique(capabilities, "set_cell");
+            }
+        }
         foreach (var action in options.Actions)
-            if (action.Value.Accepts(control)) capabilities.Add(action.Key);
+            if (AcceptsAction(action.Key, action.Value, control)) capabilities.Add(action.Key);
 
         var result = new JObject
         {
@@ -615,15 +654,39 @@ internal sealed class UiRuntime : IDisposable
             ["capabilities"] = capabilities
         };
         if (control is TextBoxBase textBox) result["readOnly"] = textBox.ReadOnly;
-        if (control is CheckBox checkBox) result["checked"] = checkBox.Checked;
-        if (control is RadioButton radioButton) result["checked"] = radioButton.Checked;
-        if (control is NumericUpDown number) result["value"] = number.Value;
-        if (control is TrackBar trackBar) result["value"] = trackBar.Value;
-        if (control is DateTimePicker dateTime) result["value"] = dateTime.Value.ToString("O");
-        if (control is ListBox listBox) result["selectedIndex"] = listBox.SelectedIndex;
-        if (control is ComboBox comboBox) result["selectedIndex"] = comboBox.SelectedIndex;
+        if (!inRedactedGrid)
+        {
+            if (control is CheckBox checkBox) result["checked"] = checkBox.Checked;
+            if (control is RadioButton radioButton) result["checked"] = radioButton.Checked;
+            if (control is NumericUpDown number) result["value"] = number.Value;
+            if (control is TrackBar trackBar) result["value"] = trackBar.Value;
+            if (control is DateTimePicker dateTime) result["value"] = dateTime.Value.ToString("O");
+            if (control is ListBox listBox) result["selectedIndex"] = listBox.SelectedIndex;
+            if (control is ComboBox comboBox) result["selectedIndex"] = comboBox.SelectedIndex;
+        }
         if (control is TabControl tabs) result["selectedIndex"] = tabs.SelectedIndex;
+        if (gridName != null) result["gridAdapter"] = gridName;
+        if (gridError != null) result["gridError"] = gridError;
         return result;
+    }
+
+    private static void AddUnique(JArray array, string value)
+    {
+        if (!array.Any(item => (string?)item == value)) array.Add(value);
+    }
+
+    // The predicate of an AddAction overload runs for every control in every tree walk and again when the
+    // action is invoked. A throw means "not advertised" / "not accepted"; one diagnostic per action name.
+    private bool AcceptsAction(string name, CustomControlAction action, Control control)
+    {
+        try { return action.Accepts(control); }
+        catch (Exception exception)
+        {
+            if (failedActionPredicates.Add(name))
+                log("action_predicate_failed", "The accepts predicate of custom action '" + name + "' failed: " +
+                    exception.GetType().Name + ": " + exception.Message);
+            return false;
+        }
     }
 
     private JObject DescribeElement(ElementAdapter adapter, object element, string? parentId, object? parent,
@@ -694,7 +757,9 @@ internal sealed class UiRuntime : IDisposable
             object? parent = ParentOf(entry, resolved);
             return DescribeElement(entry.Owner!, resolved, parent == null ? null : ParentId(parent), parent, out _);
         }
-        JObject result = Describe(control, control.Parent == null ? null : Identity(control.Parent));
+        var gridRedaction = new Dictionary<Control, bool>();
+        JObject result = Describe(control, control.Parent == null ? null : Identity(control.Parent), gridRedaction);
+        bool inRedactedGrid = grids.IsInsideRedactedGrid(control, gridRedaction);
         int maximum = ReadInt(parameters, "maxItems", 100, 1, 100);
         int start = ReadInt(parameters, "startIndex", 0, 0, int.MaxValue);
         var items = new JArray();
@@ -710,7 +775,13 @@ internal sealed class UiRuntime : IDisposable
             return true;
         }
 
-        if (control is ComboBox combo)
+        if (inRedactedGrid && (control is ComboBox || control is ListBox || control is ListView || control is TreeView))
+        {
+            // The items and which of them is selected could be the redacted column's value.
+            result["itemsUnavailable"] = "redacted-grid";
+            supported = false;
+        }
+        else if (control is ComboBox combo)
         {
             if (start > combo.Items.Count) throw new BridgeFailure("invalid_argument", "startIndex exceeds the item count.");
             result["totalItems"] = combo.Items.Count;
@@ -838,16 +909,36 @@ internal sealed class UiRuntime : IDisposable
         if (!control.Enabled) throw new BridgeFailure("disabled_control", "The target control is disabled.");
         if (!control.Visible && method != "ensure_visible")
             throw new BridgeFailure("hidden_control", "The target control is not visible.");
-        switch (method)
+        // select, scroll and set_cell on a grid (an adapter grid or a DataGridView) are grid mutations: one at a time per grid.
+        bool gridMutation = (method == "select" || method == "scroll" || method == "set_cell") &&
+            (grids.AdapterFor(control) != null || control is DataGridView);
+        if (gridMutation) grids.BeginMutation(control);
+        try
         {
-            case "invoke": Invoke(control, parameters); break;
-            case "set_text": SetText(control, parameters); break;
-            case "set_checked": SetChecked(control, parameters); break;
-            case "set_value": SetValue(control, parameters); break;
-            case "select": Select(control, parameters); break;
-            case "scroll": Scroll(control, parameters); break;
-            case "ensure_visible": EnsureVisible(control); break;
-            default: throw new BridgeFailure("unsupported_method", "The requested mutation is not supported.");
+            switch (method)
+            {
+                case "invoke": Invoke(control, parameters); break;
+                case "set_text": SetText(control, parameters); break;
+                case "set_checked": SetChecked(control, parameters); break;
+                case "set_value": SetValue(control, parameters); break;
+                // An application grid adapter handles a control before the static type switch does.
+                case "select":
+                    if (grids.AdapterFor(control) != null) grids.Select(control, parameters);
+                    else Select(control, parameters);
+                    break;
+                case "scroll":
+                    if (grids.AdapterFor(control) != null) grids.Scroll(control, parameters);
+                    else Scroll(control, parameters);
+                    break;
+                case "ensure_visible": EnsureVisible(control); break;
+                // Only a grid an adapter handles can be edited; the result says whether the edit was committed.
+                case "set_cell": return grids.SetCell(control, parameters, options.MaxTextLength);
+                default: throw new BridgeFailure("unsupported_method", "The requested mutation is not supported.");
+            }
+        }
+        finally
+        {
+            if (gridMutation) grids.EndMutation(control);
         }
         // A handler can dispose or replace its own control. Do not inspect it afterward.
         return new JObject { ["operation"] = method, ["handlerReturned"] = true };
@@ -914,7 +1005,7 @@ internal sealed class UiRuntime : IDisposable
             return;
         }
         if (action == "click" && control is Button button) { button.PerformClick(); return; }
-        if (options.TryGetAction(action, out CustomControlAction custom) && custom.Accepts(control))
+        if (options.TryGetAction(action, out CustomControlAction custom) && AcceptsAction(action, custom, control))
         {
             custom.Execute(control);
             return;
@@ -982,7 +1073,7 @@ internal sealed class UiRuntime : IDisposable
         throw new BridgeFailure("unsupported_operation", "This control does not support a typed value.");
     }
 
-    private static void Select(Control control, JObject parameters)
+    private void Select(Control control, JObject parameters)
     {
         if (control is ComboBox combo)
         {
@@ -1028,6 +1119,8 @@ internal sealed class UiRuntime : IDisposable
         {
             int row = ReadInt(parameters, "row", null, 0, grid.Rows.Count - 1);
             int column = ReadInt(parameters, "column", null, 0, grid.Columns.Count - 1);
+            // The token is optional here and checked when supplied, after the range checks.
+            grids.CheckTokenIfSupplied(grid, OptionalString(parameters, "viewToken"));
             if (!grid.Rows[row].Visible || !grid.Columns[column].Visible)
                 throw new BridgeFailure("hidden_control", "The selected grid row or column is hidden.");
             grid.CurrentCell = grid.Rows[row].Cells[column];
@@ -1037,10 +1130,12 @@ internal sealed class UiRuntime : IDisposable
         throw new BridgeFailure("unsupported_operation", "This control does not support selection.");
     }
 
-    private static void Scroll(Control control, JObject parameters)
+    private void Scroll(Control control, JObject parameters)
     {
         if (control is DataGridView grid)
         {
+            // The token is optional here and checked when supplied, before anything is scrolled.
+            grids.CheckTokenIfSupplied(grid, OptionalString(parameters, "viewToken"));
             if (HasValue(parameters, "row"))
                 grid.FirstDisplayedScrollingRowIndex = ReadInt(parameters, "row", null, 0, grid.Rows.Count - 1);
             if (HasValue(parameters, "column"))
@@ -1093,8 +1188,12 @@ internal sealed class UiRuntime : IDisposable
 
     private JObject ReadGrid(JObject parameters)
     {
-        if (!(Resolve(parameters) is DataGridView grid))
-            throw new BridgeFailure("unsupported_operation", "read_grid currently supports DataGridView only.");
+        Control target = Resolve(parameters);
+        // An application grid adapter handles a control before the built-in DataGridView handling does.
+        if (grids.AdapterFor(target) != null)
+            return grids.ReadPage(target, parameters, generation, options.MaxTextLength);
+        if (!(target is DataGridView grid))
+            throw new BridgeFailure("unsupported_operation", "read_grid supports DataGridView and controls with a registered grid adapter only.");
         int rowCount = ReadInt(parameters, "rowCount", 25, 1, 200);
         int columnCount = ReadInt(parameters, "columnCount", 20, 1, 50);
         int startRow = ReadInt(parameters, "startRow", 0, 0, grid.Rows.Count);
@@ -1145,7 +1244,9 @@ internal sealed class UiRuntime : IDisposable
             ["columns"] = columns,
             ["rows"] = rows,
             ["hasMoreRows"] = endRow < grid.Rows.Count,
-            ["hasMoreColumns"] = endColumn < grid.Columns.Count
+            ["hasMoreColumns"] = endColumn < grid.Columns.Count,
+            ["gridAdapter"] = GridAdapter.DataGridViewName,
+            ["viewToken"] = grids.CurrentToken(grid)
         };
     }
 
@@ -1228,7 +1329,7 @@ internal sealed class UiRuntime : IDisposable
         return (bool)token;
     }
 
-    private static string RequiredString(JObject input, string name, bool allowEmpty = false)
+    internal static string RequiredString(JObject input, string name, bool allowEmpty = false)
     {
         string? value = OptionalString(input, name);
         if (value == null || !allowEmpty && string.IsNullOrWhiteSpace(value))
@@ -1236,7 +1337,7 @@ internal sealed class UiRuntime : IDisposable
         return value;
     }
 
-    private static string? OptionalString(JObject input, string name)
+    internal static string? OptionalString(JObject input, string name)
     {
         JToken? value = input[name];
         if (value == null || value.Type == JTokenType.Null) return null;
@@ -1245,7 +1346,7 @@ internal sealed class UiRuntime : IDisposable
         return (string?)value;
     }
 
-    private static bool HasValue(JObject input, string name)
+    internal static bool HasValue(JObject input, string name)
         => input[name] != null && input[name]!.Type != JTokenType.Null;
 
     private void AssertUiThread()

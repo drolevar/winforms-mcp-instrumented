@@ -1,5 +1,6 @@
 using System;
 using System.ComponentModel;
+using System.Linq;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -44,7 +45,7 @@ internal sealed class WinFormsTools(ApplicationSession session)
     public Task<CallToolResult> Windows(CancellationToken cancellationToken) => Call("windows", new JObject(), cancellationToken);
 
     [McpServerTool(Name = "control_tree", ReadOnly = true)]
-    [Description("Inspect the live managed control tree. Optionally restrict it to a previously observed target. Newly created controls appear on the next request; IDs are instance identities, not HWNDs. Items of menus, toolbars, status strips and context menus found through a control's ContextMenuStrip are listed as kind: \"item\" nodes with element ids. Children of closed dropdowns are omitted from window- or control-rooted trees (childrenOmitted, childCount) and are expanded when the tree is rooted at the item. Popups opened from application code and never assigned to a control, such as an unassigned ContextMenuStrip shown with a point, are not discovered.")]
+    [Description("Inspect the live managed control tree. Optionally restrict it to a previously observed target. Newly created controls appear on the next request; IDs are instance identities, not HWNDs. Items of menus, toolbars, status strips and context menus found through a control's ContextMenuStrip are listed as kind: \"item\" nodes with element ids. Children of closed dropdowns are omitted from window- or control-rooted trees (childrenOmitted, childCount) and are expanded when the tree is rooted at the item. Popups opened from application code and never assigned to a control, such as an unassigned ContextMenuStrip shown with a point, are not discovered. A grid node carries gridAdapter (the adapter's name, or \"datagridview\") and the capabilities read_grid (always, unless the node carries gridError: adapter_failed), select, scroll and set_cell, according to what its adapter supports. A control inside a grid that has a redacted column (a hosted cell editor, for example) shows no text (textRedacted: true).")]
     public Task<CallToolResult> Tree(CancellationToken cancellationToken, string? generation = null, string? id = null,
         int maxDepth = 8, int maxNodes = 1000)
     {
@@ -96,29 +97,53 @@ internal sealed class WinFormsTools(ApplicationSession session)
     public Task<CallToolResult> SetChecked(string generation, string id, bool value, CancellationToken cancellationToken) =>
         Call("set_checked", WithTarget(generation, id, "checked", value), cancellationToken);
 
+    [McpServerTool(Name = "set_grid_cell")]
+    [Description("Queue editing one cell of a grid that has the set_cell capability (an application grid adapter), as a user would: the cell is focused, the editor opened, the text typed, the row committed. Returns an action receipt; poll action_status. A completed receipt means the edit was committed (result: displayText, rowAfter, and the new viewToken); rowAfter is null when the row left the view. A refusal is a failed receipt with error edit_rejected, whose error.details carry reason, errorText (untrusted application text) and displayText (the text now shown). viewToken comes from read_grid; row and column are positions in that view. stale_view means the view or cell changed: read_grid again. Optional expectedText must equal the current cell text, otherwise stale_view. read_only and hidden_control mean the column cannot be edited. A modal dialog opened by the application keeps the receipt started: find it with list_windows, answer it, then poll action_status again. grid_busy means another grid mutation is still running on that grid. On a bridge without set_cell the error is unsupported_operation and nothing is sent.")]
+    public async Task<CallToolResult> SetGridCell(string generation, string id, int row, int column, string text, string viewToken,
+        CancellationToken cancellationToken, string? expectedText = null)
+    {
+        // Older bridges do not know set_cell. Ask first, so that nothing is sent to them.
+        RpcResponse hello = await session.Bridge.CallAsync("hello", null, cancellationToken).ConfigureAwait(false);
+        if (hello.Error != null) return BridgeResult(hello);
+        if (hello.Result?["methods"] is not JArray methods || !methods.Any(method => (string?)method == "set_cell"))
+            return Error("unsupported_operation", "The connected bridge does not support set_cell. Use an instrumentation bridge with grid adapter support.");
+
+        var parameters = WithTarget(generation, id);
+        parameters["row"] = row;
+        parameters["column"] = column;
+        parameters["text"] = text;
+        parameters["viewToken"] = viewToken;
+        if (expectedText != null) parameters["expectedText"] = expectedText;
+        return await Call("set_cell", parameters, cancellationToken).ConfigureAwait(false);
+    }
+
     [McpServerTool(Name = "select_control")]
-    [Description("Queue selection by zero-based index for a list/combo/tab; row and column for a grid; or an integer index path for a tree. Provide only the applicable selector.")]
+    [Description("Queue selection by zero-based index for a list/combo/tab; row and column for a grid; or an integer index path for a tree. Provide only the applicable selector. On an application grid adapter, row and viewToken (from read_grid) are required and column is optional: the cell is focused, becomes the only selection and is brought into view. A stale viewToken fails with stale_view; read_grid again.")]
     public Task<CallToolResult> Select(string generation, string id, CancellationToken cancellationToken,
-        int? index = null, int? row = null, int? column = null, int[]? path = null)
+        int? index = null, int? row = null, int? column = null, int[]? path = null,
+        [Description("The viewToken returned by read_grid. Required to select on an application grid adapter; for a DataGridView it is optional and checked when supplied. stale_view means the view changed: read_grid again.")] string? viewToken = null)
     {
         var parameters = WithTarget(generation, id);
         if (index.HasValue) parameters["index"] = index.Value;
         if (row.HasValue) parameters["row"] = row.Value;
         if (column.HasValue) parameters["column"] = column.Value;
         if (path != null) parameters["path"] = new JArray(path);
+        if (viewToken != null) parameters["viewToken"] = viewToken;
         return Call("select", parameters, cancellationToken);
     }
 
     [McpServerTool(Name = "scroll_control")]
-    [Description("Queue scrolling to nonnegative x/y offsets in a scrollable container, or a zero-based row in a grid/list. Grid column is optional. Coordinates use the app's DPI context.")]
+    [Description("Queue scrolling to nonnegative x/y offsets in a scrollable container, or a zero-based row in a grid/list. Grid column is optional. Coordinates use the app's DPI context. On a grid, scrolling means bringing the row or column into view; the optional viewToken (from read_grid) is checked when supplied, and a stale one fails with stale_view.")]
     public Task<CallToolResult> Scroll(string generation, string id, CancellationToken cancellationToken,
-        int? x = null, int? y = null, int? row = null, int? column = null)
+        int? x = null, int? y = null, int? row = null, int? column = null,
+        [Description("The viewToken returned by read_grid. Optional; checked when supplied. stale_view means the view changed: read_grid again.")] string? viewToken = null)
     {
         var parameters = WithTarget(generation, id);
         if (x.HasValue) parameters["x"] = x.Value;
         if (y.HasValue) parameters["y"] = y.Value;
         if (row.HasValue) parameters["row"] = row.Value;
         if (column.HasValue) parameters["column"] = column.Value;
+        if (viewToken != null) parameters["viewToken"] = viewToken;
         return Call("scroll", parameters, cancellationToken);
     }
 
@@ -128,7 +153,7 @@ internal sealed class WinFormsTools(ApplicationSession session)
         Call("ensure_visible", WithTarget(generation, id), cancellationToken);
 
     [McpServerTool(Name = "read_grid", ReadOnly = true)]
-    [Description("Read a bounded DataGridView range using row and column collection indices and formatted text. Column indices are not visual DisplayIndex values. Does not export the entire underlying data source.")]
+    [Description("Read a bounded range of a DataGridView or an application grid adapter, using row and column collection indices and formatted text. Rows are positions in the current sorted/filtered view and may change. Column indices are not visual DisplayIndex values. Returns viewToken (pass it to select_control, scroll_control and set_grid_cell), gridAdapter, and columns with editable, valueKind, bandPath and choices where the grid provides them. Redacted cells are null. Does not export the entire underlying data source.")]
     public Task<CallToolResult> ReadGrid(string generation, string id, CancellationToken cancellationToken,
         int startRow = 0, int rowCount = 25, int startColumn = 0, int columnCount = 20)
     {

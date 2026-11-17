@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Windows.Forms;
 using WinFormsMcp.Instrumented.Elements;
+using WinFormsMcp.Instrumented.Grids;
 
 namespace WinFormsMcp.Instrumented;
 
@@ -12,6 +13,7 @@ public sealed class McpBridgeBuilder
     private readonly List<Func<Control, bool>> exclusions = new();
     private readonly Dictionary<string, CustomControlAction> actions = new(StringComparer.Ordinal);
     private readonly List<ElementAdapter> elementAdapters = new();
+    private readonly List<GridAdapter> gridAdapters = new();
 
     /// <summary>Maximum controls visited by one tree or selector request.</summary>
     public int MaxNodes { get; set; } = 2_000;
@@ -52,11 +54,28 @@ public sealed class McpBridgeBuilder
     public McpBridgeBuilder AddAction<TControl>(string name, Action<TControl> callback)
         where TControl : Control
     {
+        return Register(name, c => c is TControl, callback == null ? null : c => callback((TControl)c));
+    }
+
+    /// <summary>
+    /// Registers an explicitly named semantic action for the controls <paramref name="accepts"/> matches.
+    /// Invoke it with the standard invoke operation's action parameter. Names are unique across both
+    /// <c>AddAction</c> overloads. The predicate runs on the registered UI thread for every control in every
+    /// tree walk, so it must be cheap; an exception means "not advertised". The bridge evaluates it again
+    /// when the action is invoked. The callback runs on the control's UI thread and can open modal dialogs.
+    /// </summary>
+    public McpBridgeBuilder AddAction(string name, Func<Control, bool> accepts, Action<Control> callback)
+        => Register(name, accepts, callback);
+
+    // One validation for both AddAction overloads (the generic one passes null for a null callback).
+    private McpBridgeBuilder Register(string name, Func<Control, bool>? accepts, Action<Control>? callback)
+    {
         if (string.IsNullOrWhiteSpace(name) || name == "click" || name == "focus" || name == "open" || name == "close")
             throw new ArgumentException("Choose a nonempty custom action name other than click, focus, open, or close.", nameof(name));
+        if (accepts == null) throw new ArgumentNullException(nameof(accepts));
         if (callback == null) throw new ArgumentNullException(nameof(callback));
         if (actions.ContainsKey(name)) throw new ArgumentException("That action is already registered.", nameof(name));
-        actions.Add(name, new CustomControlAction(c => c is TControl, c => callback((TControl)c)));
+        actions.Add(name, new CustomControlAction(accepts, callback));
         return this;
     }
 
@@ -75,6 +94,22 @@ public sealed class McpBridgeBuilder
         return this;
     }
 
+    /// <summary>
+    /// Registers an adapter that lets the bridge read, select and edit a family of grid controls.
+    /// Adapters are consulted in registration order, before the built-in DataGridView handling.
+    /// The adapter runs on the registered UI thread.
+    /// </summary>
+    public McpBridgeBuilder AddGridAdapter(GridAdapter adapter)
+    {
+        if (adapter == null) throw new ArgumentNullException(nameof(adapter));
+        if (adapter.Name == GridAdapter.DataGridViewName)
+            throw new ArgumentException("The adapter name 'datagridview' is reserved for the built-in DataGridView handling.", nameof(adapter));
+        if (gridAdapters.Any(existing => existing.Name == adapter.Name))
+            throw new ArgumentException("A grid adapter with that name is already registered.", nameof(adapter));
+        gridAdapters.Add(adapter);
+        return this;
+    }
+
     internal bool IsExcluded(Control control)
     {
         foreach (var predicate in exclusions)
@@ -85,6 +120,8 @@ public sealed class McpBridgeBuilder
     internal IEnumerable<KeyValuePair<string, CustomControlAction>> Actions => actions;
 
     internal IReadOnlyList<ElementAdapter> ElementAdapters => elementAdapters;
+
+    internal IReadOnlyList<GridAdapter> GridAdapters => gridAdapters;
 
     internal bool TryGetAction(string name, out CustomControlAction action)
         => actions.TryGetValue(name, out action!);

@@ -26,6 +26,7 @@ internal sealed class MainForm : Form
         tabs.TabPages.Add(DynamicControls());
         tabs.TabPages.Add(GridControls());
         tabs.TabPages.Add(ScrollingControls());
+        tabs.TabPages.Add(CustomGridControls());
         Controls.Add(tabs);
         var footer = new Panel { Name = "statusPanel", Dock = DockStyle.Bottom, Height = 42 };
         footer.Controls.Add(_status);
@@ -135,6 +136,26 @@ internal sealed class MainForm : Form
             tree.Nodes.Add(parent);
         }
         tree.ExpandAll(); split.Panel2.Controls.Add(tree); page.Controls.Add(split);
+        return page;
+    }
+
+    private TabPage CustomGridControls()
+    {
+        var page = new TabPage("Custom grid") { Name = "tabCustomGrid" };
+        var grid = new DemoGrid { Name = "demoGrid", Dock = DockStyle.Fill, ReportStatus = text => _status.Text = text };
+        FlowLayoutPanel bar = Panel("customGridBar");
+        bar.Dock = DockStyle.Top;
+        bar.AutoSize = true;
+        bar.AutoScroll = false;
+        bar.Controls.Add(Note("An owner-drawn grid on a plain control. Double-click a Quantity cell to edit it (negative values are refused, values above 1000 ask for confirmation), click a header to sort, or right-click a row."));
+        bar.Controls.Add(Button("btnSortGrid", "Sort by quantity", () =>
+        {
+            grid.Sort(DemoGrid.QuantityColumn, grid.SortColumn == DemoGrid.QuantityColumn && !grid.SortDescending);
+            _status.Text = "Sorted by quantity" + (grid.SortDescending ? ", descending" : ", ascending");
+        }));
+        // The grid fills what the bar leaves: it is added first, so the bar is docked first and takes the top edge.
+        page.Controls.Add(grid);
+        page.Controls.Add(bar);
         return page;
     }
 

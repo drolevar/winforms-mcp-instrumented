@@ -114,9 +114,14 @@ It also returns `bridgeVersion` and a `limits` object describing the configured
 node, depth, text, image, UI-wait, action and transport bounds. These limits are
 advertised, not negotiated by the caller. It also returns `elementAdapters`, the
 names of the element adapters in the order they are consulted: the application's
-adapters in registration order, then the built-in `toolstrip`. The `methods` list
-does not change when an adapter is added; adapters change what `tree`, `inspect`
-and `invoke` return, not which methods exist.
+adapters in registration order, then the built-in `toolstrip`. It likewise
+returns `gridAdapters`: the application's grid adapters in registration order,
+then the built-in `datagridview` (a reserved name that application adapters
+cannot use; with none registered the list is `["datagridview"]`). The `methods`
+list does not change when an adapter is added; adapters change what `tree`,
+`inspect`, `invoke` and `read_grid` return, not which methods exist. It does
+contain `set_cell`, which is part of the bridge itself, so a sidecar can tell an
+older bridge (no `set_cell`) from a current one.
 
 Every frame read and write has a 30-second deadline. Expiry disposes the pipe,
 records a bounded transport diagnostic and allows a new connection. A client
@@ -139,11 +144,12 @@ created MCP tools: opening a hundred buttons should not add a hundred tools.
 | `invoke` | Target, optional `action` | Schedule the adapter's semantic default action, or a named action (for an element: `click`, `open`, `close`). |
 | `set_text` | Target, text | Set supported editable text through its adapter. |
 | `set_value` | Target, typed value | Set a supported numeric/date/range value. |
-| `select` | Target, item index; grid row and column; or tree index path | Select a supported item, page, cell, or node. |
+| `select` | Target, item index; grid row and column (and `viewToken`); or tree index path | Select a supported item, page, cell, or node. On a grid an adapter handles, `row` and `viewToken` are required. |
 | `set_checked` | Target, checked state | Set a supported check/radio state. |
-| `scroll` | Target, x/y viewport offsets or row/column indexes | Scroll with explicit units; no unspecified wheel semantics. |
+| `scroll` | Target, x/y viewport offsets or row/column indexes, optional `viewToken` | Scroll with explicit units; no unspecified wheel semantics. On a grid, bring the row or column into view. |
 | `ensure_visible` | Target | Ask an appropriate parent adapter to reveal the target. |
-| `read_grid` | Target, row offset, bounded row/column counts | Read a page of supported grid values without serializing the data source. |
+| `set_cell` | Target, `row`, `column`, `text`, `viewToken`, optional `expectedText` | Edit one cell of a grid an adapter handles, through its editor. A queued mutation: the receipt's result says the edit was committed, a refusal is a failed receipt `edit_rejected`. See [grid adapters](10-grid-adapters.md). |
+| `read_grid` | Target, row offset, bounded row/column counts | Read a page of supported grid values without serializing the data source; returns a `viewToken`. |
 | `capture` | Scope, target/region, optional window frame | Visible-screen PNG data with bounds, dimensions, mode, and warnings. |
 | `action_status` | Action receipt ID and generation | Queued, started, completed, or failed action state. |
 | `diagnostics` | None | Most recent 100 instrumentation diagnostics and explicitly captured failures. |
@@ -217,6 +223,53 @@ controls only. See [element adapters](09-element-adapters.md).
 unknown optional fields. Nothing was removed or renamed. A consumer that reads
 only control nodes can ignore `kind: "item"` nodes.
 
+### Grid fields and `set_cell`
+
+Grids are controls, so they stay `kind: "control"` nodes; rows and cells are never
+nodes. A grid node adds `gridAdapter` (the adapter's name, or `datagridview`) and,
+when its adapter failed, `gridError: "adapter_failed"`. Its `capabilities` list
+gains `read_grid` always and `select`, `scroll` and `set_cell` as its adapter
+reports. `read_grid` keeps every earlier field and adds `gridAdapter`,
+`viewToken`, and for adapter grids `totalRows`, `focusedRow`, `focusedColumn`,
+per-column `field`, `editable`, `valueKind`, `bandPath`, `redacted`, `choices`,
+`choicesTruncated` and per-row `selected` and `truncated`. A `DataGridView` read
+adds only `gridAdapter` and `viewToken`. Design, contract and limits:
+[grid adapters](10-grid-adapters.md).
+
+`textRedacted: true` with `text: null` (until now only for password boxes) is also
+set for every control that is a descendant of a grid an adapter handles when that
+grid has at least one redacted column: a hosted cell editor can hold the text of such
+a column, also after the grid has hidden it. For such a descendant `value`, `checked`
+and `selectedIndex` are omitted as well, and `inspect` lists no items
+(`itemsUnavailable: "redacted-grid"`). The field is the existing one; only the cases
+in which it is true are new. It fails closed: when the adapter handles the grid but
+its view or a column cannot be read (or `Attach` failed), the grid counts as
+redacted. The grid control itself and controls outside the grid's subtree are not
+affected.
+
+`viewToken` is opaque (`"<random salt>.<counter>"` today; callers must not parse
+it). A grid mutation carries the token of the read it is based on; a token that is
+not current fails with `stale_view`. The error does not return the current token.
+`select` and `scroll` accept an optional `viewToken`; `set_cell` requires one.
+
+`set_cell` is a queued mutation like the others. Its completed result is
+`{operation: "set_cell", handlerReturned: true, committed: true, displayText,
+displayTextRedacted, rowAfter, viewToken}`, plus `displayTextTruncated: true` when
+`displayText` was cut. A refusal by the application is a failed receipt with
+`error.code: "edit_rejected"`. A failed receipt's `error` object may carry an
+optional `details` object (additive; omitted when the error has none):
+`edit_rejected` carries `{reason, errorText, displayText}` (plus
+`displayTextRedacted: true` for a redacted column), `stale_view` carries
+`{reason: "view_changed" | "cell_changed"}`, and the `expectedText` refusals carry
+`{reason: "cell_truncated" | "column_redacted"}`.
+
+**Compatibility.** All of this is additive: new optional fields, new optional
+parameters, one new method (`set_cell`) and new error codes. The protocol stays at
+version 1. A sidecar that finds no `set_cell` in `hello.methods` answers
+`set_grid_cell` with `unsupported_operation` without sending anything. A sidecar
+that predates grids cannot send `viewToken`, so it cannot select on an adapter grid
+(the token is required there); that combination is documented, not tested.
+
 ## Actions must not block the next observation
 
 A click handler can call `ShowDialog()`. Waiting for that handler to return
@@ -284,8 +337,12 @@ disconnection until another app instance becomes available.
 | `target_not_found` | Resolve a new selector or inspect the tree. |
 | `ambiguous_target` | Add a supported type constraint, or inspect the tree and choose a concrete instance ID. |
 | `unsupported_method`, `unsupported_operation` | Use an implemented method and an advertised control capability. |
-| `disabled_control`, `hidden_control`, `read_only`, `focus_failed` | The requested action cannot be applied in the current state. |
+| `disabled_control`, `hidden_control`, `read_only`, `focus_failed` | The requested action cannot be applied in the current state. For a grid, `hidden_control` is a hidden grid or column and `read_only` a column that cannot be edited. |
 | `not_realized` | An element has no on-screen layout, so `open` or `close` cannot apply; open the parent menu or show the window first. |
+| `stale_view` | A grid's view (or, with `expectedText`, a cell) changed after it was read; `details.reason` is `view_changed` or `cell_changed`. Read the grid again. |
+| `edit_rejected` | The application refused a `set_cell` edit; `details` carry `reason`, `errorText` (untrusted) and the text now shown. A failed receipt, never a completed one. |
+| `adapter_failed` | A grid adapter threw, or failed to attach to or describe the grid. The message names the adapter, the member and the exception type; for members that handle cell data it never includes the exception's message. |
+| `grid_busy` | Another select, scroll or `set_cell` on the same grid is still in progress (for example waiting in a modal dialog); wait, then retry. |
 | `capture_unavailable`, `no_windows` | No suitable visible capture target is available. |
 | `capture_limit`, `response_limit`, `scope_limit` | Reduce capture area/page size or adjust documented observation limits. |
 | `ui_changed` | The window collection changed during observation; obtain a fresh snapshot. |

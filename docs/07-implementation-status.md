@@ -9,10 +9,14 @@ Windows desktop merely because it compiles.
 
 This snapshot was updated on **2026-11-13** after the first execution on
 Windows, and again the same day after element adapters (menus, toolbars and a
-public adapter seam) were implemented and run. It is an implementation draft;
-the adapter seam has not been published yet (version `0.1.0-alpha.2` is on nuget.org without it; a `v0.1.0-alpha.1` tag exists, but nuget.org lists only
-`0.1.0-alpha.2`, and `ElementAdapter` becomes
-public API from the next published version). In a Git
+public adapter seam) were implemented and run, and on **2026-11-17** after grid
+adapters were implemented (validated differently: see
+[Grid adapters, 2026-11-17](#grid-adapters-2026-11-17), including what was not
+run). It is an implementation draft.
+Version `0.1.0-alpha.3` (the element adapters; tag `v0.1.0-alpha.3` on commit
+`2e2a62c`) was published to nuget.org. The grid-adapter work is implemented but not
+yet released or published: it is planned for `0.1.0-alpha.4`, and `GridAdapter`
+becomes public API with that version. In a Git
 checkout MinVer derives the version from history and tags (`0.1.0-alpha.0.N`
 before any tag exists); a source archive without Git history uses the explicit
 fallback `0.1.0-alpha.0`.
@@ -30,13 +34,14 @@ fallback `0.1.0-alpha.0`.
 | Inspection | Flat bounded tree, state and capabilities; password-value redaction; bounded inspect-only list items and tree index paths |
 | Actions | Semantic invocation/focus, editable text, checked state, numeric/date values, selection, scrolling and ensure-visible |
 | Modal behavior | Queued receipts with `queued`, `started`, `completed`, `failed`; pipe loop remains independent of UI handlers |
-| Data | Bounded DataGridView row/column collection-index reads using formatted cell values |
+| Data | Bounded DataGridView row/column collection-index reads using formatted cell values; since 2026-11-17 the same bounded read for any grid an application registered a grid adapter for (see Grids) |
 | Capture | Visible-screen PNGs of control/window/region/app windows; ancestor and desktop clipping; metadata and combined image budget |
-| Builder | Optional limits, subtree exclusions and named actions for application-defined control types; `AddElementAdapter` registers an element adapter (name `^[a-z0-9._-]{1,48}\z`, `toolstrip` reserved) |
-| Sidecar | Official MCP SDK stdio host, 19 fixed tools, startup-independent process management and bounded retained output; uniform camelCase `error.code/message/details` for sidecar and bridge errors |
+| Builder | Optional limits, subtree exclusions and named actions for application-defined control types; `AddElementAdapter` registers an element adapter (name `^[a-z0-9._-]{1,48}\z`, `toolstrip` reserved); `AddGridAdapter` registers a grid adapter (same name rule, `datagridview` reserved, duplicates refused); an `AddAction(name, Func<Control,bool> accepts, Action<Control> callback)` overload advertises a named action only for the controls the predicate accepts (a throwing predicate means not advertised; evaluated again when the action is invoked; the names are unique across both overloads) |
+| Sidecar | Official MCP SDK stdio host, 20 fixed tools (`set_grid_cell` added), startup-independent process management and bounded retained output; uniform camelCase `error.code/message/details` for sidecar and bridge errors |
 | Elements | Identity registry keyed on the object, with adapter ownership; public `ElementAdapter` seam (namespace `WinFormsMcp.Instrumented.Elements`); built-in `ToolStripAdapter` for menus, toolbars, status strips and context menus reached through `Control.ContextMenuStrip`; `kind: "item"` nodes in `tree` and `inspect`; targeting by `generation` + `id` with a four-step stale check; item-rooted trees expand fully while window- or control-rooted trees collapse closed dropdowns (`childrenOmitted`, `childCount`); `invoke_control` `click`, `open`, `close` with prechecks, `not_realized`, `handlerDeferred` and the observed `opened`; `hello.elementAdapters`. See [element adapters](09-element-adapters.md) and [ADR 0004](adr/0004-element-adapters.md) |
+| Grids | Public `GridAdapter` seam (namespace `WinFormsMcp.Instrumented.Grids`; five abstract members, the rest virtual) with an internal `GridHost` that owns adapter lookup (`Accepts` once per control, cached), the per-grid freshness state (`"<salt>.<counter>"`, advanced by `GridViewSignal.Changed()` or by a changed fingerprint; held weakly, so a grid is still collected), paging and bounds, and fault isolation. `read_grid` generalized (no longer DataGridView-only) and returns `viewToken`; `select_control` and `scroll_control` take an optional `viewToken` (required to select on an adapter grid); new `set_grid_cell` (bridge method `set_cell`): editor-path edit, completed means committed, a refused edit is a failed receipt `edit_rejected` with `details`. New errors `stale_view`, `edit_rejected`, `adapter_failed`, `grid_busy` (a per-grid in-progress flag) and the reuse of `read_only`, `hidden_control`, `unsupported_operation`; no exception message from a data-bearing adapter member reaches the wire or the diagnostics. A `DataGridView` gets a fingerprint-only `viewToken` and `gridAdapter: "datagridview"`. `hello` advertises `gridAdapters` and `set_cell`. See [grid adapters](10-grid-adapters.md) and [ADR 0005](adr/0005-grid-adapters.md) |
 | Shipping exclusion | Conditional consumer dependency and source symbol; graph, PE metadata, output and config checks |
-| Sample | Standard controls, modal dialog, replacement/reparenting/HWND recreation, grid/tree, scrolling, a `MenuStrip` (nested submenu, a disabled item), a context menu and DPI-aware manifest |
+| Sample | Standard controls, modal dialog, replacement/reparenting/HWND recreation, grid/tree, scrolling, a `MenuStrip` (nested submenu, a disabled item), a context menu and DPI-aware manifest; a "Custom grid" tab with an owner-drawn `DemoGrid` and its `DemoGridAdapter` (the consumer example: an editable column, read-only columns, banded headers, validation that refuses negative values, a confirm dialog above 1000, a context menu with an `Opening` handler) and a `show_context_menu` action (`ContextMenuStrip.Show`, closing an open strip first so a second call runs `Opening` again). The adapter file is compiled out of the stripped build |
 
 The protocol includes selectors for bridge-level integrations; the fixed MCP
 tools use observed `generation`/`id` targets. Selection positions and tree paths
@@ -138,6 +143,61 @@ identity (now dropped and logged; see the Control-emission rule in [element adap
 closed context menu was not collapsed because it reported no `ChildCount`; and
 `hello` did not list the built-in adapter.
 
+### Grid adapters, 2026-11-17
+
+Implemented and tested; **not yet released or published** at the time of writing. Unlike the sections above, the Windows UI tests
+were deliberately **not** run on the interactive desktop: they ran inside a Windows
+Sandbox so that no test window appeared on the host. The sandbox was driven by a
+local helper kept outside version control (`artifacts/sandbox/run-tests.ps1`, which
+queues a job for a runner inside the sandbox; the runner copies the test output and
+calls `vstest.console.exe`). Only what was executed is listed.
+
+| Command or run | Result |
+| --- | --- |
+| Windows test suite (net48, `WinFormsMcp.Instrumented.Tests.dll`, whole assembly) run with `vstest.console.exe` in the Windows Sandbox | **167 of 167 passed, 0 failed, 0 skipped** (the final run, after the demo tests and the final fix wave; 72 before the grid work, so 95 new tests; the fix wave added 9: hosted-editor redaction in the tree and inspect, including during a validation modal, the non-redacted contrast, fail-closed, hidden value and items, capabilities that follow the routing, the leak negative control, the post-commit token refresh failure, a null `SetCell` result and the 200-character diagnostic cap). Earlier runs during the work had one test, the menu-open test, report Inconclusive (counted as skipped: 96 passed of 97 in one run) because the sandbox window could not be activated; the final run did not |
+| `dotnet test tests/WinFormsMcp.Instrumented.Server.Tests -p:MinVerVersionOverride=0.1.0-alpha.0` (host) | 19 passed (was 12: 7 new, and one test that pinned 19 tools replaced by one that pins 20) |
+| `dotnet test tests/WinFormsMcp.Instrumented.Protocol.Tests -p:MinVerVersionOverride=0.1.0-alpha.0` (host) | 20 passed |
+| `dotnet build WinFormsMcp.Instrumented.slnx -c Debug -p:MinVerVersionOverride=0.1.0-alpha.0` (host) | Succeeded, 0 warnings, 0 errors (warnings are errors in this repository) |
+| `dotnet build samples/InstrumentedDemo -c Release -p:MinVerVersionOverride=0.1.0-alpha.0` (stripped build, no instrumentation) | Succeeded; the stripped output has no reference to the bridge assembly (the adapter source file is excluded from that build) |
+| `python -m py_compile eng/exercise-demo.py` | Syntax OK. The new section of the script was **not executed** |
+
+What the 95 new Windows tests cover, through a real pipe and message loop, with a
+test-only `FakeGrid` and `FakeGridAdapter` and, for the last group, the demo's own
+grid and adapter linked into the test project: adapter registration and hello order;
+capabilities per feature; fault isolation (a throwing `Accepts`, `Attach`,
+`GetFeatures` and read members); the freshness token (stable across reads,
+selects and scrolls; stale after an event-driven change and after a change seen only
+by the fingerprint; per-grid salt); bounds and the response budget; `select` and
+`scroll` with and without a token; `set_grid_cell` commit, `read_only`,
+`hidden_control`, `edit_rejected`, `expectedText` refusals, a view change during the
+edit, a modal edit that leaves the receipt `started`, `grid_busy`; redaction (a
+secret appears in no read, receipt or diagnostic); no exception message from a
+data-bearing member on the wire or in diagnostics; a disposed grid; the grid being
+collected after its form closes; the `DataGridView` token; the `AddAction`
+overload. Ten tests drive the demo grid over the pipe, including the context-menu
+action. A negative control (the guarded behavior broken on purpose, a test seen to
+fail, the code restored) was shown for the leak, redaction, busy, dispose and live
+view-change guards. Several groups were written first and seen to fail (for
+example 10 of 10 demo-grid tests failed against empty stubs before the demo grid
+existed).
+
+**Not run, and not claimed:**
+
+- **The real desktop exercise**, `./eng/build.ps1 -DesktopExercise`, with the new
+  section of `eng/exercise-demo.py`. It needs the .NET 10 sidecar and Python and
+  moves windows on an interactive desktop. The script is expected to run 95 checks
+  (72 existing plus 23 new; counted statically, not observed). Until it runs, the
+  sidecar-to-demo path, the new demo tab layout and the owner-drawn painting are
+  unexercised, and so are the mouse and in-cell editing paths a person uses.
+- **The Linux CI run of the new sidecar tests.** The new tests use a fake bridge
+  over a named pipe and passed on the Windows host; they have no operating-system
+  guard and the first Linux run has not happened.
+- **A real third-party grid adapter.** One lives outside this repository (the public
+  repository deliberately has none); the seam was exercised only through the fake
+  grid and the demo grid.
+- A host run of the Windows UI tests on an interactive desktop, which the earlier
+  sections used.
+
 ### What the Windows suite pins
 
 Beyond the supplied discovery/identity/modal/authentication tests, the suite
@@ -197,6 +257,13 @@ active); the inactive-window case, where `opened` can be `false`, was **not
 executed** in the desktop exercise or through the bridge, only measured in the
 plain-WinForms spike.
 
+The matrix above is the 72 checks that were run on 2026-11-13. `eng/exercise-demo.py`
+has since gained a section for the custom grid (23 checks: adapter advertisement, a
+read with its token, select, a committed edit, `read_only`, `edit_rejected`, a
+confirm dialog that holds the receipt `started`, a sort that makes the token stale,
+and `show_context_menu`). That section has been syntax-checked only; it has **not**
+been run.
+
 ## Current limitations
 
 - **One registered UI thread.** Other UI-thread windows are skipped and counted;
@@ -206,9 +273,42 @@ plain-WinForms spike.
   status strips, context menus) are supported by the built-in adapter. Native
   common dialogs, hosted WPF/browser/native surfaces, virtual grid item
   identities (rows and cells are deliberately not tree nodes), third-party
-  control suites (an application supplies its own `ElementAdapter`; none is
-  shipped or was run), and custom owner-drawn hit targets still need dedicated
-  adapters.
+  control suites (an application supplies its own `ElementAdapter` or
+  `GridAdapter`; none is shipped or was run), and custom owner-drawn hit targets
+  still need dedicated adapters.
+- **Grid freshness depends on what the adapter reports.** Without
+  `GridViewSignal.Changed()` calls, freshness is fingerprint-based: a change that
+  keeps the fingerprint (row count, column count, data-source identity, sort
+  state) is not seen. A plain `List<T>`-style source changed behind the grid's back
+  may raise no change events and does not change the fingerprint; `expectedText`
+  and a fresh `read_grid` are the cover. The `DataGridView` token is
+  fingerprint-only (no events are subscribed), and a `DataGridView` cannot be
+  edited through the bridge.
+- **Grid editing is bounded by what was exercised.** Editing through the editor
+  was tested against the fake grid and the demo grid, not against a real
+  third-party grid. Whether an editor can be activated in a background window is
+  unmeasured (the bridge does not activate windows); the adapter then answers
+  `editor_not_shown`. A direct `MessageBox` in application code cannot be
+  suppressed and leaves the receipt `started` (by design). Not supported: tree
+  lists, property grids, card or layout views, grouping, master-detail, virtual or
+  server modes, the new-item row, adding or deleting rows, multi-range selection.
+  `GetFeatures` and the `AddAction` predicate run for every control in every tree
+  walk and must be cheap.
+- **Hosted editors.** A hidden cell editor that is a child of an adapter grid keeps
+  its text unless the application clears it. The bridge hides the text, value,
+  checked state, selection and items of every descendant of an adapter grid that has
+  a redacted column (`textRedacted: true`), failing closed when the grid's columns
+  cannot be read. An editor shown outside the grid's control tree is not covered.
+- **Showing a context menu.** There is no built-in way to show a strip's menu (`open` on a
+  `context_menu` element is not supported: the adapter receives no source control).
+  The application registers an action with the `AddAction` predicate overload; the
+  demo's `show_context_menu` calls `ContextMenuStrip.Show`, which runs `Opening`
+  (observed in the sandbox test), but whether the strip stays visible in a
+  background window was not asserted.
+- **UI tests ran in a Windows Sandbox for the grid work.** This avoids windows on the
+  developer's desktop but is not the desktop the earlier sections used: window
+  activation and foreground rules differ, which is why one menu test reported
+  Inconclusive in earlier sandbox runs.
 - **Menu `open` is best-effort.** In the plain-WinForms spike a dropdown was not
   visible after 500 ms when its form was not the active window (another form of
   the process active, or another process in the foreground). `open` always
@@ -275,15 +375,22 @@ plain-WinForms spike.
    tests is done.
 3. ToolStrip/menu support (the public `ElementAdapter` seam, the built-in
    `ToolStripAdapter` and the object-keyed registry) is **done** (bead
-   `WinFormsMcp_Instrumented-am4`). Still to do: a deliberate virtual-element
-   identity model and grid adapter (a separate base class with paged reads and a
-   freshness token, never row nodes), an inactive-window `open` check through the
-   bridge, and the DPI work of item 1 (element bounds at other display scales
-   were not run either). Extend multi-UI-thread coverage through registered
+   `WinFormsMcp_Instrumented-am4`), and the grid adapter (a separate base class with
+   paged reads and a freshness token, never row nodes) is **implemented and
+   tested** as of 2026-11-17 (see "Grid adapters, 2026-11-17"). Still to do: a
+   deliberate virtual-element identity model, an inactive-window `open` check
+   through the bridge, and the DPI work of item 1 (element bounds at other display
+   scales were not run either). Extend multi-UI-thread coverage through registered
    dispatchers.
-4. Add alternative capture backends only with distinct capability reporting and
+4. Grid adapters, remaining before release: run the real desktop exercise
+   (`./eng/build.ps1 -DesktopExercise`) with the go-ahead on timing (it moves
+   windows), watch the first Linux CI run of the new sidecar tests, and, when a real
+   third-party adapter exists outside this repository, record what it showed here.
+   Publish the next prerelease (planned as `0.1.0-alpha.4`; it makes `GridAdapter` public API) only
+   with the maintainer's go-ahead; it has not been released or published.
+5. Add alternative capture backends only with distinct capability reporting and
    tests for occlusion, minimization, DPI, and child-window behavior.
-5. Add distribution metadata for the actual remote repository, choose a release
+6. Add distribution metadata for the actual remote repository, choose a release
    version/tag, and publish only when explicitly requested.
 
 ## Desktop exercise

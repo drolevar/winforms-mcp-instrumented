@@ -4,7 +4,8 @@
 This is the executable form of the manual exercise in docs/07-implementation-status.md.
 It launches the sidecar, which launches the instrumented demo, and performs the
 observe/act/verify cycles for standard controls, the modal dialog, identity changes,
-captures and the application restart. Every check is recorded; the script exits
+captures, an application grid adapter (read, select, edit, stale views, a context menu)
+and the application restart. Every check is recorded; the script exits
 non-zero if any check fails. It never touches processes it did not start.
 
     python eng/exercise-demo.py --captures artifacts/validation/captures -- \
@@ -21,6 +22,7 @@ import base64
 import importlib.util
 import json
 import pathlib
+import re
 import struct
 import sys
 import time
@@ -447,6 +449,153 @@ def exercise(client: Any, report: Report, captures: pathlib.Path) -> None:
     if old_receipt.get("actionId"):
         report.check("stale-ID mutation receipt ends failed with stale_target",
                      s.wait(old_receipt)["error"]["code"] == "stale_target")
+
+    # --- a custom grid through an application grid adapter ------------------
+    # demoGrid is an owner-drawn control; samples/InstrumentedDemo/DemoGridAdapter.cs teaches the bridge to read,
+    # select and edit it. Its editor needs a realized grid, so its tab is selected first.
+    r = s.act("select_control", "mainTabs", index=4)
+    report.check("select the custom grid tab", r["state"] == "completed" and s.inspect("mainTabs")["selectedIndex"] == 4, r)
+    demo = s.node("demoGrid")
+    report.check("the demo grid advertises the adapter's capabilities and the context menu action",
+                 demo.get("gridAdapter") == "demo-grid"
+                 and all(c in demo.get("capabilities", []) for c in ("read_grid", "select", "scroll", "set_cell", "show_context_menu")), demo)
+
+    def read_demo(**extra: Any) -> dict[str, Any]:
+        node = s.node("demoGrid")
+        return tools.result("read_grid", generation=node["generation"], id=node["id"], **extra)
+
+    def cells(page: dict[str, Any], row: int) -> list[str]:
+        return page["rows"][row]["cells"]
+
+    def details_of(status: dict[str, Any]) -> dict[str, Any]:
+        return (status.get("error") or {}).get("details") or {}
+
+    page = read_demo()
+    token = page.get("viewToken")
+    columns = page.get("columns", [])
+    report.check("read_grid on demoGrid returns the adapter name, a viewToken and the row and column counts",
+                 page.get("gridAdapter") == "demo-grid" and isinstance(token, str) and re.fullmatch(r"[0-9a-f]{16}\.\d+", token) is not None
+                 and page.get("totalRows") == 12 and page.get("totalColumns") == 3 and page.get("focusedRow") is None, page)
+    report.check("read_grid columns carry editable flags and value kinds",
+                 [c.get("editable") for c in columns] == [False, True, False]
+                 and [c.get("valueKind") for c in columns] == ["text", "number", "number"], columns)
+    report.check("read_grid columns carry the band path of the banded header",
+                 [c.get("bandPath") for c in columns] == [None, ["Stock", "On hand"], ["Stock", "Held"]], columns)
+    report.check("read_grid returns the display text of the rows", cells(page, 0) == ["Anvil", "30", "5"] and cells(page, 1) == ["Bolt", "10", "0"], page["rows"][:2])
+
+    # The grid's ContextMenuStrip is reached through the grid. Its Delete item is enabled by the strip's Opening
+    # handler, which runs only when the strip is shown: the show_context_menu action does that. Whether the strip then
+    # stays visible depends on the window being active, so the observed state is reported, not required.
+    grid_tree = tools.result("control_tree", generation=demo["generation"], id=demo["id"])
+    strip = next((n for n in grid_tree["nodes"] if n.get("name") == "ctxGrid"), {})
+    report.check("the grid's ContextMenuStrip is reached through the grid as a closed context_menu element",
+                 strip.get("kind") == "item" and strip.get("role") == "context_menu"
+                 and strip.get("parentId") == demo["id"] and strip.get("opened") is False, strip)
+    items = subtree(strip)
+    report.check("before the menu was ever shown, ctxGridDelete is disabled and ctxGridInfo is enabled",
+                 items.get("ctxGridDelete", {}).get("enabled") is False and items.get("ctxGridInfo", {}).get("enabled") is True, items)
+    r = act_on(s.node("demoGrid"), action="show_context_menu")
+    observed = tools.result("inspect_control", generation=strip["generation"], id=strip["id"])
+    items = subtree(strip)
+    report.notes["gridContextMenuOpenedWithoutSelection"] = observed.get("opened")
+    report.check("show_context_menu with no row selected completes, Delete stays disabled and the observed opened state is reported",
+                 r["state"] == "completed" and isinstance(observed.get("opened"), bool)
+                 and items.get("ctxGridDelete", {}).get("enabled") is False and items.get("ctxGridInfo", {}).get("enabled") is True,
+                 [r, observed, items])
+    if observed.get("opened") is True:
+        act_on(strip, action="close")
+
+    r = s.act("select_control", "demoGrid", row=3, column=1, viewToken=token)
+    page = read_demo()
+    report.check("select_control row and column completes and read_grid shows the focus and the one selected row",
+                 r["state"] == "completed" and page.get("focusedRow") == 3 and page.get("focusedColumn") == 1
+                 and [row.get("selected") for row in page["rows"]] == [i == 3 for i in range(12)] and page.get("viewToken") == token,
+                 [r, page.get("focusedRow"), page.get("focusedColumn"), page.get("viewToken")])
+
+    delete_before = subtree(strip).get("ctxGridDelete", {}).get("enabled")
+    r = act_on(s.node("demoGrid"), action="show_context_menu")
+    observed = tools.result("inspect_control", generation=strip["generation"], id=strip["id"])
+    items = subtree(strip)
+    report.notes["gridContextMenuOpenedWithSelection"] = observed.get("opened")
+    report.check("after a row was selected, show_context_menu runs Opening: ctxGridDelete is enabled and ctxGridInfo still is",
+                 delete_before is False and r["state"] == "completed" and isinstance(observed.get("opened"), bool)
+                 and items.get("ctxGridDelete", {}).get("enabled") is True and items.get("ctxGridInfo", {}).get("enabled") is True,
+                 [delete_before, r, observed, items])
+    if observed.get("opened") is True:
+        act_on(strip, action="close")
+
+    r = s.act("set_grid_cell", "demoGrid", row=1, column=1, text="11", viewToken=token)
+    page = read_demo()
+    committed = r.get("result") or {}
+    report.check("set_grid_cell on the editable column completes as committed; read_grid shows the new text and a new token",
+                 r["state"] == "completed" and committed.get("committed") is True and committed.get("displayText") == "11"
+                 and committed.get("rowAfter") == 1 and cells(page, 1)[1] == "11"
+                 and page.get("viewToken") != token and page.get("viewToken") == committed.get("viewToken"), [r, page.get("viewToken"), token])
+    token = page["viewToken"]
+
+    refusals = [s.act("set_grid_cell", "demoGrid", row=1, column=column, text="x", viewToken=token) for column in (0, 2)]
+    page = read_demo()
+    report.check("the read-only columns give read_only and change nothing",
+                 all(x["state"] == "failed" and x["error"]["code"] == "read_only" for x in refusals)
+                 and cells(page, 1) == ["Bolt", "11", "0"] and page.get("viewToken") == token, [refusals, page["rows"][1]])
+
+    r = s.act("set_grid_cell", "demoGrid", row=1, column=1, text="-5", viewToken=token)
+    report.check("a negative quantity gives edit_rejected with the reason, the application's error text and the text still shown",
+                 r["state"] == "failed" and r["error"]["code"] == "edit_rejected"
+                 and details_of(r).get("reason") == "validation_failed"
+                 and details_of(r).get("errorText") == "Quantity must not be negative." and details_of(r).get("displayText") == "11", r)
+    r = s.act("set_grid_cell", "demoGrid", row=1, column=1, text="abc", viewToken=token)
+    report.check("text in the number column gives edit_rejected with reason invalid_input",
+                 r["state"] == "failed" and r["error"]["code"] == "edit_rejected" and details_of(r).get("reason") == "invalid_input"
+                 and details_of(r).get("errorText") == "Quantity must be a whole number.", r)
+    names = [w["name"] for w in tools.result("list_windows")["windows"]]
+    page = read_demo()
+    report.check("refused edits left no dialog open and no change (they were failed receipts, not message boxes)",
+                 names == ["MainForm"] and cells(page, 1)[1] == "11" and page.get("viewToken") == token, [names, page["rows"][1]])
+
+    target = s.node("demoGrid")
+    receipt = tools.result("set_grid_cell", generation=target["generation"], id=target["id"], row=2, column=1, text="1500", viewToken=token)
+    keep = s.wait_for_node("btnConfirmKeep")
+    status = tools.result("action_status", generation=receipt["generation"], actionId=receipt["actionId"])
+    names = [w["name"] for w in tools.result("list_windows")["windows"]]
+    held = read_demo()
+    report.check("a large quantity opens the confirm dialog: the receipt stays started, the dialog is listed and the value is held",
+                 status["state"] == "started" and "dlgConfirmQuantity" in names and cells(held, 2)[1] == "20", [status, names, held["rows"][2]])
+    s.wait(tools.result("invoke_control", generation=keep["generation"], id=keep["id"]))
+    final = s.wait(receipt)
+    page = read_demo()
+    report.check("keeping the change through the bridge completes the receipt as committed; read_grid shows it with a new token",
+                 final["state"] == "completed" and (final.get("result") or {}).get("committed") is True
+                 and (final.get("result") or {}).get("displayText") == "1500" and cells(page, 2)[1] == "1500" and page.get("viewToken") != token,
+                 [final, page["rows"][2]])
+    token = page["viewToken"]
+
+    target = s.node("demoGrid")
+    receipt = tools.result("set_grid_cell", generation=target["generation"], id=target["id"], row=4, column=1, text="2000", viewToken=token)
+    discard = s.wait_for_node("btnConfirmDiscard")
+    s.wait(tools.result("invoke_control", generation=discard["generation"], id=discard["id"]))
+    final = s.wait(receipt)
+    page = read_demo()
+    report.check("discarding the confirm dialog fails the receipt as edit_rejected and changes nothing",
+                 final["state"] == "failed" and final["error"]["code"] == "edit_rejected"
+                 and details_of(final).get("reason") == "validation_failed" and details_of(final).get("errorText") == "The change was not confirmed."
+                 and details_of(final).get("displayText") == "45" and cells(page, 4)[1] == "45" and page.get("viewToken") == token,
+                 [final, page["rows"][4]])
+
+    stale_token = token
+    r = s.act("invoke_control", "btnSortGrid")
+    page = read_demo()
+    report.check("sorting through the demo's button re-orders the rows and gives a new viewToken",
+                 r["state"] == "completed" and cells(page, 0)[0] == "Lathe" and page.get("viewToken") != stale_token, [r, page["rows"][0], page.get("viewToken")])
+    r = s.act("select_control", "demoGrid", row=0, column=1, viewToken=stale_token)
+    report.check("a select with the token read before the sort fails as stale_view",
+                 r["state"] == "failed" and r["error"]["code"] == "stale_view" and details_of(r).get("reason") == "view_changed", r)
+    r = s.act("set_grid_cell", "demoGrid", row=0, column=1, text="9", viewToken=stale_token)
+    report.check("an edit with the token read before the sort fails as stale_view and writes nothing",
+                 r["state"] == "failed" and r["error"]["code"] == "stale_view" and cells(read_demo(), 0)[1] == "2", r)
+    r = s.act("select_control", "demoGrid", row=0, column=1, viewToken=page["viewToken"])
+    report.check("after read_grid again, the fresh token selects the first row of the new order",
+                 r["state"] == "completed" and read_demo().get("focusedRow") == 0, r)
 
     # --- restart while MCP stays connected --------------------------------
     stale = replacement

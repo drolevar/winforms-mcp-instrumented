@@ -28,7 +28,7 @@ EXPECTED_TOOLS = {
     "app_status", "app_launch", "app_stop", "app_restart", "app_logs",
     "list_windows", "control_tree", "inspect_control", "invoke_control",
     "set_text", "set_value", "set_checked", "select_control", "scroll_control",
-    "ensure_visible", "read_grid", "capture", "action_status", "bridge_diagnostics",
+    "ensure_visible", "read_grid", "set_grid_cell", "capture", "action_status", "bridge_diagnostics",
 }
 
 
@@ -178,6 +178,13 @@ def exercise(client: Client) -> dict[str, Any]:
           "Capture schema is missing scope, target, or region parameters.")
     invoke_required = set(tools["invoke_control"].get("inputSchema", {}).get("required", []))
     check({"generation", "id"}.issubset(invoke_required), "Invocation schema must require a concrete instance target.")
+    set_cell_required = set(tools["set_grid_cell"].get("inputSchema", {}).get("required", []))
+    check({"generation", "id", "row", "column", "text", "viewToken"}.issubset(set_cell_required),
+          "set_grid_cell must require the target, the cell, the text and the viewToken.")
+    check("expectedText" not in set_cell_required, "set_grid_cell must not require expectedText.")
+    for grid_tool in ("select_control", "scroll_control"):
+        grid_required = set(tools[grid_tool].get("inputSchema", {}).get("required", []))
+        check("viewToken" not in grid_required, grid_tool + " must not require viewToken (it is optional on a DataGridView).")
 
     status_result = client.tool("app_status")
     check(not status_result.get("isError", False), "Offline app_status should still be a successful observation.")

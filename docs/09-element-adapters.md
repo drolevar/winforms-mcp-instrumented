@@ -220,7 +220,7 @@ result lists the application adapters in registration order followed by
   → `unsupported_operation`; `!Enabled` → `disabled_control`; `!Available` →
   `hidden_control`; `open` or `close` while `!Visible` → `not_realized`.
 - `AddAction` reserves the names `open` and `close`. This is a breaking builder
-  change for consumers of `0.1.0-alpha.x` (version `0.1.0-alpha.2` is published)
+  change for consumers of `0.1.0-alpha.x` (it arrived with `0.1.0-alpha.3`, which is published)
   who registered custom actions named `open` or `close`. That is acceptable for a
   0.x alpha line, but it must be called out in the release notes and the README.
 
@@ -373,6 +373,13 @@ evaluation surface CLAUDE.md forbids, and replaces compile-time errors with
 runtime strings.
 
 ## Grid readiness
+
+> **Update.** The grid work reserved below has since been designed and
+> implemented as a separate seam: see [grid adapters](10-grid-adapters.md) and
+> [ADR 0005](adr/0005-grid-adapters.md). The text of this section is the
+> readiness reasoning as written for the element work, kept for the record; the
+> rule that rows are never tree nodes still stands, and the `GridAdapter` class,
+> `viewToken`, and the wire fields it needed now exist.
 
 Needed now, and already part of this design: the object-keyed registry with
 adapter ownership; container nodes that are not controls (a view or column may

@@ -7,7 +7,8 @@ churn the catalog whenever a window opens or controls are replaced. The sidecar
 therefore exposes a small fixed vocabulary; fresh inspection supplies the
 control IDs, states and supported actions used with that vocabulary.
 
-The server currently exposes 19 tools. Read operations are annotated read-only.
+The server currently exposes 20 tools (`set_grid_cell` was added for grid
+adapters). Read operations are annotated read-only.
 Mutation annotations remain conservative because an application's button handler
 can have effects beyond its visual state.
 
@@ -27,10 +28,11 @@ can have effects beyond its visual state.
 | `set_text` | `generation`, `id`, `text` | Editable text assignment |
 | `set_value` | `generation`, `id`, `value` | Numeric value or ISO date string for a supported control |
 | `set_checked` | `generation`, `id`, `value` | Boolean state for check/radio controls |
-| `select_control` | `generation`, `id`; `index` or `row`+`column` or `path` | Selection appropriate to the observed control type |
-| `scroll_control` | `generation`, `id`; `x`/`y` or `row`/`column` | Absolute container offsets or indexed list/grid scrolling |
+| `select_control` | `generation`, `id`; `index` or `row`+`column` or `path`; optional `viewToken` | Selection appropriate to the observed control type; on an adapter grid `row` and `viewToken` are required, see [grids](#grids) |
+| `scroll_control` | `generation`, `id`; `x`/`y` or `row`/`column`; optional `viewToken` | Absolute container offsets or indexed list/grid scrolling |
 | `ensure_visible` | `generation`, `id` | Select ancestor tabs, then scroll ancestor containers; see [reveal order](04-controls-and-capture.md) |
-| `read_grid` | `generation`, `id`, bounded row/column range | Formatted DataGridView values |
+| `set_grid_cell` | `generation`, `id`, `row`, `column`, `text`, `viewToken`; optional `expectedText` | Edit one cell of an adapter grid through its editor; a queued mutation, see [grids](#grids) |
+| `read_grid` | `generation`, `id`, bounded row/column range | Formatted values of a DataGridView or of a grid with a registered grid adapter, plus a `viewToken` |
 | `capture` | `scope="application"`, optional target, `includeFrame=false`, optional `region` | PNG image content and capture metadata |
 | `action_status` | `generation`, `actionId` | Queued action progress/result/error |
 | `bridge_diagnostics` | — | Bounded bridge-specific diagnostics |
@@ -73,15 +75,101 @@ They do not carry the persistent identity guarantees of managed control IDs.
 Grid arguments use row and column collection indices. Columns can be visually
 reordered independently; `DisplayIndex` is not the index expected by these
 tools. `read_grid` returns formatted strings, which may reflect locale and
-application formatting. It does not expose the entire bound data source.
+application formatting. It does not expose the entire bound data source. See
+[grids](#grids) for third-party grids.
 
 Text assignment raises normal control change behavior but does not generate a
 sequence of physical keystrokes. Custom actions are named callbacks registered
 by the application; there is no unrestricted reflection or code-evaluation tool.
 
+## Grids
+
+`read_grid` reads a `DataGridView`, and a third-party grid when the application
+registered a grid adapter for it ([grid adapters](10-grid-adapters.md)). A grid
+node in `control_tree` and `inspect_control` carries `gridAdapter` (the adapter's
+name, or `datagridview`) and the capabilities `read_grid` (always), `select`,
+`scroll` and `set_cell`, according to what its adapter supports. A grid whose
+adapter failed carries `gridError: "adapter_failed"` and no grid capabilities.
+
+- **Read, then act on that read.** `read_grid` returns a `viewToken`. Rows are
+  positions in the current sorted and filtered view, so a row number is only
+  valid with the token of the read that produced it. `select_control` (adapter
+  grids: `row` and `viewToken` required, `column` optional; the cell is focused,
+  becomes the only selection and is brought into view), `scroll_control`
+  (`viewToken` optional) and `set_grid_cell` (`viewToken` required) fail with
+  `stale_view` when the view changed after that read: read the grid again. The
+  current token is deliberately not in the error. On a `DataGridView` the token
+  is a fingerprint (row count, column count, data-source identity, sort) and is
+  optional for `select_control` and `scroll_control`.
+- **`read_grid` fields.** Existing fields are unchanged. For an adapter grid it
+  adds `gridAdapter`, `viewToken`, `totalRows`, `focusedRow`, `focusedColumn`;
+  per column `field`, `editable`, `valueKind`, `bandPath`, `redacted`, `choices`
+  (at most 50, with `choicesTruncated`); per row `selected` and `truncated`
+  (the column indexes whose text was cut). Redacted cells are `null`. A
+  `DataGridView` read adds `gridAdapter: "datagridview"` and `viewToken` only.
+  Limits are the same as for a `DataGridView`: 200 rows, 50 columns, 256K
+  characters, with `response_limit` beyond.
+- **Text inside a grid with a redacted column.** In `control_tree` and
+  `inspect_control`, a control that is a descendant of such a grid (a hosted cell
+  editor, for example) has `text: null` and `textRedacted: true`, and no `value`,
+  `checked`, `selectedIndex` or listed items, because the editor can hold the
+  redacted column's text. If the grid's view cannot be read, the grid counts as
+  redacted.
+- **`set_grid_cell`** edits one cell the way a user does: the adapter focuses the
+  cell, opens the editor, sets the text, posts it and commits the row, so the
+  application's own validation runs. It is a queued mutation: it returns a
+  receipt and you poll `action_status`. **`completed` means the edit was
+  committed.** The result is `{operation: "set_cell", handlerReturned: true,
+  committed: true, displayText, displayTextRedacted, rowAfter, viewToken}`:
+  `displayText` is the text now shown, `rowAfter` the row's new position (null
+  when it left the view), `viewToken` the token after the edit (null if the grid
+  was disposed or could not be read afterwards; then read the grid again).
+  `displayTextTruncated: true` is added when the text was cut at the configured
+  text limit.
+- **A refused edit is a failed receipt**, never a completed one: `state:
+  "failed"`, `error.code: "edit_rejected"` and `error.details` of `{reason,
+  errorText, displayText}`. `reason` is one of `not_editable`,
+  `editor_not_shown`, `invalid_input`, `ambiguous_input`, `validation_failed`,
+  `row_not_committed`, `other`. `errorText` (at most 1,024 characters) is the
+  application's own message and is untrusted text; `displayText` is what the
+  cell shows now. For a redacted column both are `null` and the details carry
+  `displayTextRedacted: true`.
+- **`text`** is typed as a user would type it: in the application's UI culture,
+  exactly one choice's display text for a choice column (`read_grid` lists
+  them), `""` to clear where the editor allows it. What is accepted for a date,
+  time or duration column depends on the adapter: ISO 8601 is only what adapter
+  authors are recommended to accept, not something the bridge guarantees. The
+  bridge converts nothing.
+- **`expectedText`** (optional) must equal the cell's current full text, compared
+  ordinally; otherwise `stale_view` with `details.reason: "cell_changed"`. It is
+  refused with `invalid_argument` and `details.reason: "cell_truncated"` when the
+  cell text is longer than the text limit (the agent could not have read it
+  whole), and with `column_redacted` for a redacted column.
+- **A modal dialog keeps the receipt `started`.** If the application opens a
+  `MessageBox` or `ShowDialog` while the edit is posted, the receipt stays
+  `started`: find the dialog with `list_windows`, answer it, then poll
+  `action_status`. It ends `completed` or `edit_rejected`.
+- **Grid errors.** `stale_view` (view or cell changed), `read_only` (the column
+  cannot be edited), `hidden_control` (a hidden column, or a hidden grid),
+  `edit_rejected`, `not_realized` (the adapter reported `GridOperationError.NotRealized`:
+  the grid has no on-screen layout yet), `adapter_failed` (the adapter threw, or failed to attach to
+  the grid), `grid_busy` (another select, scroll or edit on the same grid is
+  still running; it is reported before the other grid checks, and other grids
+  are independent) and `unsupported_operation` (a `DataGridView`, which cannot be
+  edited, a grid whose adapter lacks the feature, a control no adapter handles).
+  Malformed arguments are `invalid_argument`, and the argument shape is checked
+  before the feature check, so a bad request to a grid without `set_cell` is
+  `invalid_argument`. An adapter's exception message is never relayed for
+  members that handle cell data (adapter name, member and exception type only).
+- **Older bridges.** `set_grid_cell` asks the bridge for its `hello` first; a
+  bridge whose `methods` lacks `set_cell` gets `unsupported_operation` and no
+  request. `select_control` on an adapter grid needs the `viewToken` argument,
+  which an older sidecar cannot send.
+
 ## Menus, toolbars and other elements
 
-No tool was added for menus: the tool count is still 19. Elements that are not
+No tool was added for menus (the count stayed at 19 for that work; the later
+grid work added `set_grid_cell`, making it 20). Elements that are not
 controls appear in `control_tree` as nodes with `kind: "item"` and the same
 `generation` + `id` pair. The built-in adapter covers menu strips, tool strips,
 status strips and context menus reached through a control's `ContextMenuStrip`;
@@ -99,7 +187,7 @@ an application can register adapters for other suites (see
   text, enabled, available, checked, shortcut, `opened`, `childCount`, bounds when
   shown, capabilities). Selectors and the control-only tools (`set_text`,
   `set_value`, `set_checked`, `select_control`, `scroll_control`,
-  `ensure_visible`, `read_grid`, `capture`) do not apply to an element and answer
+  `ensure_visible`, `set_grid_cell`, `read_grid`, `capture`) do not apply to an element and answer
   `unsupported_operation` after the stale-target check.
 - **`invoke_control` with `action="click"`** runs the item's click semantically
   even when its menu is closed. Prechecks: an action the element does not declare

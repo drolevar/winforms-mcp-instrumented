@@ -318,6 +318,127 @@ namespace WinFormsMcp.Instrumented.Tests
             Assert.ThrowsExactly<ArgumentException>(() => builder.AddAction<Button>("open", _ => { }));
             Assert.ThrowsExactly<ArgumentException>(() => builder.AddAction<Button>("close", _ => { }));
             builder.AddAction<Button>("custom", _ => { });
+            ArgumentNullException nullCallback = Assert.ThrowsExactly<ArgumentNullException>(() => builder.AddAction<Button>("no-callback", null!));
+            Assert.AreEqual("callback", nullCallback.ParamName);
+        }
+
+        // --- grid adapter registration and the AddAction predicate overload ---------------------------
+
+        [TestMethod]
+        public async Task GridAdapterNamesAreValidatedAndAppearInHello()
+        {
+            foreach (string bad in new[] { "", "Upper", "has space", new string('a', 49), "fake\n", new string('a', 48) + "\n" })
+                Assert.ThrowsExactly<ArgumentException>(() => new NamedGridAdapter(bad), "Name '" + bad + "' must be rejected.");
+            Assert.ThrowsExactly<ArgumentNullException>(() => new McpBridgeBuilder().AddGridAdapter(null!));
+
+            var builder = new McpBridgeBuilder().AddGridAdapter(new NamedGridAdapter("same"));
+            Assert.ThrowsExactly<ArgumentException>(() => builder.AddGridAdapter(new NamedGridAdapter("same")));
+            Assert.ThrowsExactly<ArgumentException>(() => builder.AddGridAdapter(new NamedGridAdapter("datagridview")),
+                "The built-in name is reserved.");
+
+            using (var app = new TestApplication(options => options.AddGridAdapter(new NamedGridAdapter("fake-grid")), _ => { }))
+            {
+                JToken hello = Success(await app.RequestAsync("hello"));
+                CollectionAssert.AreEqual(new[] { "fake-grid", "datagridview" }, ((JArray)hello["gridAdapters"]!).Select(n => (string?)n).ToArray());
+            }
+
+            // Registration order is kept (not sorted), and the built-in handling is always last.
+            using (var app = new TestApplication(options => options
+                .AddGridAdapter(new NamedGridAdapter("b")).AddGridAdapter(new NamedGridAdapter("a")), _ => { }))
+            {
+                JToken hello = Success(await app.RequestAsync("hello"));
+                CollectionAssert.AreEqual(new[] { "b", "a", "datagridview" }, ((JArray)hello["gridAdapters"]!).Select(n => (string?)n).ToArray());
+            }
+
+            using (var app = new TestApplication())
+            {
+                JToken hello = Success(await app.RequestAsync("hello"));
+                CollectionAssert.AreEqual(new[] { "datagridview" }, ((JArray)hello["gridAdapters"]!).Select(n => (string?)n).ToArray());
+            }
+        }
+
+        [TestMethod]
+        public void AddActionWithAPredicateValidatesNames()
+        {
+            var builder = new McpBridgeBuilder();
+            Func<Control, bool> accepts = _ => true;
+            Action<Control> callback = _ => { };
+            Assert.ThrowsExactly<ArgumentException>(() => builder.AddAction("", accepts, callback));
+            Assert.ThrowsExactly<ArgumentException>(() => builder.AddAction("  ", accepts, callback));
+            foreach (string reserved in new[] { "click", "focus", "open", "close" })
+                Assert.ThrowsExactly<ArgumentException>(() => builder.AddAction(reserved, accepts, callback), reserved);
+            Assert.ThrowsExactly<ArgumentNullException>(() => builder.AddAction("custom", null!, callback));
+            Assert.ThrowsExactly<ArgumentNullException>(() => builder.AddAction("custom", accepts, null!));
+
+            builder.AddAction("custom", accepts, callback);
+            Assert.ThrowsExactly<ArgumentException>(() => builder.AddAction("custom", accepts, callback));
+            Assert.ThrowsExactly<ArgumentException>(() => builder.AddAction<Button>("custom", _ => { }),
+                "Names are unique across both overloads.");
+            builder.AddAction<Button>("other", _ => { });
+            Assert.ThrowsExactly<ArgumentException>(() => builder.AddAction("other", accepts, callback));
+        }
+
+        [TestMethod]
+        public void GridColumnDescriptionLimitsBandsAndChoices()
+        {
+            // Bridge-owned types have internal constructors and this assembly has no InternalsVisibleTo.
+            var description = (WinFormsMcp.Instrumented.Grids.GridColumnDescription)Activator.CreateInstance(
+                typeof(WinFormsMcp.Instrumented.Grids.GridColumnDescription), nonPublic: true)!;
+            System.Reflection.PropertyInfo truncated = typeof(WinFormsMcp.Instrumented.Grids.GridColumnDescription)
+                .GetProperty("ChoicesTruncated", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+            Assert.IsNotNull(truncated, "GridColumnDescription.ChoicesTruncated was not found; this test reads it by reflection.");
+
+            Assert.IsTrue(description.Visible, "A column is visible unless the adapter says otherwise.");
+            Assert.IsFalse(description.Editable);
+            Assert.IsFalse(description.Redacted);
+            Assert.AreEqual(WinFormsMcp.Instrumented.Grids.GridValueKind.Text, description.ValueKind);
+
+            for (int i = 0; i < 8; i++)
+                Assert.IsTrue(description.AddBand(i == 3 ? null : "Band " + i), "Band " + (i + 1) + " must be accepted.");
+            Assert.IsFalse(description.AddBand("Ninth"), "The 9th band must be refused.");
+
+            for (int i = 0; i < 50; i++)
+                Assert.IsTrue(description.AddChoice("Choice " + i), "Choice " + (i + 1) + " must be accepted.");
+            Assert.IsFalse((bool)truncated.GetValue(description)!, "Exactly 50 choices are not truncated.");
+            Assert.IsFalse(description.AddChoice("Fifty-first"), "The 51st choice must be refused.");
+            Assert.IsTrue((bool)truncated.GetValue(description)!, "Refusing a choice must flag the list as truncated.");
+        }
+
+        [TestMethod]
+        public void AGridViewSignalRefusesNoStateAndNeverThrowsFromChanged()
+        {
+            // The signal runs inside application event handlers; its constructor is internal, so read it by reflection.
+            Type? stateType = typeof(McpBridge).Assembly.GetType("WinFormsMcp.Instrumented.Grids.GridState");
+            Assert.IsNotNull(stateType, "GridState was not found; this test reads it by reflection.");
+            const System.Reflection.BindingFlags Any = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public
+                | System.Reflection.BindingFlags.NonPublic;
+
+            var refused = Assert.ThrowsExactly<System.Reflection.TargetInvocationException>(() => Activator.CreateInstance(
+                typeof(WinFormsMcp.Instrumented.Grids.GridViewSignal), Any, null, new object?[] { null }, null));
+            Assert.IsInstanceOfType<ArgumentNullException>(refused.InnerException);
+
+            object state = Activator.CreateInstance(stateType!, Any, null, null, null)!;
+            var signal = (WinFormsMcp.Instrumented.Grids.GridViewSignal)Activator.CreateInstance(
+                typeof(WinFormsMcp.Instrumented.Grids.GridViewSignal), Any, null, new[] { state }, null)!;
+            signal.Changed();
+            signal.Changed();
+        }
+
+        private sealed class NamedGridAdapter : WinFormsMcp.Instrumented.Grids.GridAdapter
+        {
+            internal NamedGridAdapter(string name) : base(name) { }
+
+            public override bool Accepts(Control control) => false;
+
+            public override WinFormsMcp.Instrumented.Grids.GridFeatures GetFeatures(Control grid)
+                => WinFormsMcp.Instrumented.Grids.GridFeatures.None;
+
+            public override WinFormsMcp.Instrumented.Grids.GridViewInfo GetViewInfo(Control grid)
+                => new WinFormsMcp.Instrumented.Grids.GridViewInfo(0, 0, 0);
+
+            public override void DescribeColumn(Control grid, int column, WinFormsMcp.Instrumented.Grids.GridColumnDescription d) { }
+
+            public override string? GetCellText(Control grid, int row, int column) => null;
         }
 
         private sealed class NamedAdapter : WinFormsMcp.Instrumented.Elements.ElementAdapter

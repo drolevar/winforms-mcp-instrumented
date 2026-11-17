@@ -11,7 +11,8 @@ internal static class Program
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
 #if WINFORMS_MCP_INSTRUMENTED
-        using (WinFormsMcp.Instrumented.McpBridge.Start())
+        // What the bridge is taught about the demo (the grid adapter and the context menu action) is in DemoGridAdapter.RegisterWith.
+        using (WinFormsMcp.Instrumented.McpBridge.Start(DemoGridAdapter.RegisterWith))
         {
             Application.Run(new MainForm());
         }

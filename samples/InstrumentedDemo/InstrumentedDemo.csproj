@@ -16,6 +16,10 @@
     <DefineConstants
       Condition="'$(EnableWinFormsMcpInstrumentation)' == 'true'">$(DefineConstants);WINFORMS_MCP_INSTRUMENTED</DefineConstants>
   </PropertyGroup>
+  <ItemGroup Condition="'$(EnableWinFormsMcpInstrumentation)' != 'true'">
+    <!-- The adapter is written against the bridge's public API, which a stripped build does not reference. -->
+    <Compile Remove="DemoGridAdapter.cs" />
+  </ItemGroup>
   <ItemGroup Condition="'$(EnableWinFormsMcpInstrumentation)' == 'true'">
     <ProjectReference Include="../../src/WinFormsMcp.Instrumented/WinFormsMcp.Instrumented.csproj" />
   </ItemGroup>

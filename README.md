@@ -39,6 +39,12 @@ from the consuming application's shipping build.
   and a public adapter seam for third-party control suites.
 - Semantic button invocation, focus, text, numeric/date values, checked states,
   selections, scrolling, and bounded DataGridView reads.
+- Third-party grids through a public grid adapter seam: bounded `read_grid` with
+  column metadata, a `viewToken` so a row position is never applied to a re-sorted
+  view, select and scroll, and cell editing through the grid's own editor
+  (`set_grid_cell`: a completed receipt means committed, a refused edit is a
+  failed receipt). The adapter for a given grid suite is written in the
+  application, not in this repository.
 - Dynamic creation, replacement, disposal, and reparenting observed on the next
   request. Native handle recreation preserves managed control identity.
 - Queued action receipts, so a modal dialog can be inspected and closed while
@@ -56,12 +62,20 @@ nodes that can be listed, inspected and clicked). Menu `open` is best-effort and
 reports the observed state: in a plain-WinForms measurement (once per condition) a
 dropdown did not stay visible while its window was not active, and that
 inactive-window case has not been run through the bridge. Applications can add
-adapters for third-party control suites. Native common dialogs, hosted foreign
-UI, and virtual elements (grid rows and cells) do not yet have adapters. Popups shown from code and never assigned to a control are
-not discovered, and individual elements cannot be excluded. Screen capture needs
-an interactive desktop and visible, non-minimized windows; overlapping windows can
-appear in the pixels. See [control behavior](docs/04-controls-and-capture.md) and
-[element adapters](docs/09-element-adapters.md).
+adapters for third-party control suites and for third-party grids. Grid rows and
+cells are never tree nodes: they are positions in a view, read with `read_grid` and
+guarded by a `viewToken`. A `DataGridView` can be read, selected and scrolled but
+not edited. Freshness for a grid whose adapter gives no change signal is
+fingerprint-based, so a change that keeps the fingerprint is not seen; editing was
+tested against a fake grid and a demo grid, not a real third-party grid, and an
+adapter written outside this repository is the only way to cover one. Native common
+dialogs and hosted foreign UI do not yet have adapters. Popups shown from code and
+never assigned to a control are not discovered, and individual elements cannot be
+excluded. Screen capture needs an interactive desktop and visible, non-minimized
+windows; overlapping windows can appear in the pixels. See
+[control behavior](docs/04-controls-and-capture.md),
+[element adapters](docs/09-element-adapters.md) and
+[grid adapters](docs/10-grid-adapters.md).
 
 ## Build and run on Windows
 
@@ -157,6 +171,27 @@ Application.Run(new MainForm());
 discovery/actions, not pixels captured from a containing window. Keep all custom
 instrumentation code under the same build condition.
 
+Registering a grid adapter and an action that applies only to some controls:
+
+```csharp
+#if WINFORMS_MCP_INSTRUMENTED
+using (WinFormsMcp.Instrumented.McpBridge.Start(builder =>
+{
+    builder.AddGridAdapter(new MyGridAdapter());      // derives from GridAdapter
+    // Advertised only for controls the predicate accepts; the predicate runs for
+    // every control in every tree walk, so keep it cheap. A throwing predicate
+    // means "not advertised".
+    builder.AddAction("show_context_menu", control => control.ContextMenuStrip != null,
+        control => control.ContextMenuStrip!.Show(control, new Point(10, 10)));
+}))
+#endif
+```
+
+`MyGridAdapter` is an illustrative app-defined type; `samples/InstrumentedDemo`
+has a complete one (`DemoGridAdapter`) for an owner-drawn grid. Showing a context
+menu with `ContextMenuStrip.Show` sets its `SourceControl` and raises `Opening`;
+the demo's action closes an open strip first so a second call runs `Opening` again.
+
 See the complete [conditional PackageReference integration](docs/05-integration-and-stripping.md).
 
 ## Shipping builds
@@ -198,10 +233,17 @@ line. A downloaded source archive uses the explicit prerelease fallback
 `0.1.0-alpha.0`, never an invented stable release. The private pipe protocol has
 its own compatibility version.
 
-From the next published version after `0.1.0-alpha.2`, `ElementAdapter` and its
+Since `0.1.0-alpha.3` (published), `ElementAdapter` and its
 companion types are public API, and `McpBridgeBuilder.AddAction` reserves the
 action names `open` and `close`: a consumer of `0.1.0-alpha.x` that registered a
 custom action with one of those names must rename it.
+
+The grid work (planned for `0.1.0-alpha.4`, not yet published) makes `GridAdapter`
+and its companion types public API, adds the `AddAction(name, accepts, callback)`
+overload, reserves `datagridview` as a grid-adapter name (an application adapter
+cannot use it), and brings the sidecar to **20 tools** (`set_grid_cell` is new;
+`select_control` and `scroll_control` gain an optional `viewToken`). The bridge
+protocol stays at version 1: every change is additive.
 
 `eng/build.ps1` writes local packages under `artifacts/packages`. After building:
 
@@ -227,6 +269,7 @@ for details and source-archive behavior. Publishing is a separate step.
 | [Implementation status](docs/07-implementation-status.md) | Implemented scope, validation, and next work |
 | [Tool reference](docs/08-mcp-tools.md) | MCP tool arguments and common workflows |
 | [Element adapters](docs/09-element-adapters.md) | Menus, toolbars and third-party elements: seam, identity, measured limits |
+| [Grid adapters](docs/10-grid-adapters.md) | Reading, selecting and editing third-party grids: seam, freshness token, edit semantics, limits |
 | [Architecture decisions](docs/adr/) | Decision records and consequences |
 
 Coding agents should read [AGENTS.md](AGENTS.md). Claude Code guidance is in

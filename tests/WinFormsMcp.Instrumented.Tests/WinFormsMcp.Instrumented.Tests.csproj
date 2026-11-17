@@ -14,4 +14,9 @@
     <PackageReference Include="MSTest.TestAdapter" />
     <ProjectReference Include="../../src/WinFormsMcp.Instrumented/WinFormsMcp.Instrumented.csproj" />
   </ItemGroup>
+  <ItemGroup>
+    <!-- The demo grid and its adapter are consumer code: they are compiled here to be driven through the bridge's wire. -->
+    <Compile Include="..\..\samples\InstrumentedDemo\DemoGrid.cs" Link="Demo\DemoGrid.cs" />
+    <Compile Include="..\..\samples\InstrumentedDemo\DemoGridAdapter.cs" Link="Demo\DemoGridAdapter.cs" />
+  </ItemGroup>
 </Project>

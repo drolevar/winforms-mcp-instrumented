@@ -233,6 +233,7 @@ namespace WinFormsMcp.Instrumented.Tests
             }
 
             internal string PipeName { get; }
+            internal IDisposable Bridge { get; private set; } = null!;
             internal Form Window { get; private set; } = null!;
             internal RecreatingButton HandleButton { get; private set; } = null!;
             internal Panel RightPanel { get; private set; } = null!;
@@ -246,7 +247,7 @@ namespace WinFormsMcp.Instrumented.Tests
             {
                 try
                 {
-                    using (McpBridge.Start(options =>
+                    using (Bridge = McpBridge.Start(options =>
                     {
                         options.UiRequestTimeout = TimeSpan.FromSeconds(3);
                         options.Exclude(control => control.Name == "Excluded");

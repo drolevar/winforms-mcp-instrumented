@@ -206,6 +206,7 @@ internal sealed class BridgeHost : IDisposable
                 ["captureMode"] = "screen_copy",
                 ["methods"] = new JArray(UiRuntime.Methods),
                 ["elementAdapters"] = new JArray(ui.AdapterNames),
+                ["gridAdapters"] = new JArray(ui.GridAdapterNames),
                 ["limits"] = new JObject
                 {
                     ["maxFrameBytes"] = BridgeProtocol.MaxFrameBytes,
