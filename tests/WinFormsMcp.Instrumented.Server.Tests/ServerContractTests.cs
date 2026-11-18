@@ -296,31 +296,58 @@ public sealed class ServerContractTests
 
         public WinFormsTools Tools() => new(new ApplicationSession(_options));
 
+        private readonly List<Task> _handlers = new();
+
+        // The next listening instance is created before the current connection is served. A client that connects
+        // between two calls (the sidecar opens a connection per call, and one extra hello connection for the
+        // set_grid_cell capability gate) then always finds a listener; on Linux a named pipe is a unix socket and a
+        // client that arrives while no instance exists is refused.
         private async Task Serve()
         {
             while (!_stop.IsCancellationRequested)
             {
+                NamedPipeServerStream? pipe = null;
                 try
                 {
-                    await using var pipe = new NamedPipeServerStream(_options.PipeName, PipeDirection.InOut, 1,
-                        PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+                    pipe = new NamedPipeServerStream(_options.PipeName, PipeDirection.InOut,
+                        -1 /* unlimited instances */, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
                     await pipe.WaitForConnectionAsync(_stop.Token);
-                    RpcRequest hello = (await FrameCodec.ReadAsync<RpcRequest>(pipe, _stop.Token))!;
-                    await FrameCodec.WriteAsync(pipe, new RpcResponse
-                    {
-                        Id = hello.Id,
-                        Generation = "g1",
-                        Result = new JObject { ["methods"] = new JArray(_methods) }
-                    }, _stop.Token);
-                    RpcRequest? request = await FrameCodec.ReadAsync<RpcRequest>(pipe, _stop.Token);
-                    if (request == null) continue;
-                    lock (Requests) Requests.Add(request);
-                    await FrameCodec.WriteAsync(pipe, new RpcResponse { Id = request.Id, Generation = "g1", Result = Respond(request) }, _stop.Token);
-                    // Let the client read the response before the pipe is disposed.
-                    await FrameCodec.ReadAsync<RpcRequest>(pipe, _stop.Token);
+                    NamedPipeServerStream connected = pipe;
+                    pipe = null;
+                    lock (_handlers) _handlers.Add(Task.Run(() => Handle(connected)));
                 }
                 catch (OperationCanceledException) { }
                 catch (System.IO.IOException) { }
+                finally
+                {
+                    if (pipe != null) await pipe.DisposeAsync();
+                }
+            }
+        }
+
+        private async Task Handle(NamedPipeServerStream pipe)
+        {
+            try
+            {
+                RpcRequest hello = (await FrameCodec.ReadAsync<RpcRequest>(pipe, _stop.Token))!;
+                await FrameCodec.WriteAsync(pipe, new RpcResponse
+                {
+                    Id = hello.Id,
+                    Generation = "g1",
+                    Result = new JObject { ["methods"] = new JArray(_methods) }
+                }, _stop.Token);
+                RpcRequest? request = await FrameCodec.ReadAsync<RpcRequest>(pipe, _stop.Token);
+                if (request == null) return;
+                lock (Requests) Requests.Add(request);
+                await FrameCodec.WriteAsync(pipe, new RpcResponse { Id = request.Id, Generation = "g1", Result = Respond(request) }, _stop.Token);
+                // Let the client read the response before the pipe is disposed.
+                await FrameCodec.ReadAsync<RpcRequest>(pipe, _stop.Token);
+            }
+            catch (OperationCanceledException) { }
+            catch (System.IO.IOException) { }
+            finally
+            {
+                await pipe.DisposeAsync();
             }
         }
 
@@ -328,6 +355,9 @@ public sealed class ServerContractTests
         {
             _stop.Cancel();
             try { await _loop; } catch (OperationCanceledException) { }
+            Task[] handlers;
+            lock (_handlers) handlers = _handlers.ToArray();
+            try { await Task.WhenAll(handlers); } catch (OperationCanceledException) { }
             _stop.Dispose();
         }
     }
