@@ -7,9 +7,10 @@ an AI coding agent through an independent MCP server. The application exposes
 its live managed control tree and standard control operations; the server keeps
 the MCP connection alive while the application closes, crashes, or restarts.
 
-This is a documentation-first implementation draft. Package names are proposed
-and no public release is implied. Read the
-[purpose and rationale](docs/00-overview.md) first, then the
+The packages are published to nuget.org as prereleases (`0.1.0-alpha.x`), so you
+add them with `--prerelease`; there is nothing to build from source to use them.
+Start with [Getting started](#getting-started). Read the
+[purpose and rationale](docs/00-overview.md) for the why, then the
 [implementation status](docs/07-implementation-status.md) for the exact supported
 scope and validation results.
 
@@ -31,7 +32,7 @@ registration. Optional builder configuration supplies exclusions, limits, and
 custom semantic actions. A build property removes the bridge and all its calls
 from the consuming application's shipping build.
 
-## What the draft includes
+## What it includes
 
 - Live windows and control-tree inspection, with opaque instance identities.
 - Menu, toolbar, status-strip and context-menu items in the same tree, with
@@ -77,65 +78,148 @@ windows; overlapping windows can appear in the pixels. See
 [element adapters](docs/09-element-adapters.md) and
 [grid adapters](docs/10-grid-adapters.md).
 
-## Build and run on Windows
+## Getting started
 
-Prerequisites: a .NET 10 SDK, PowerShell 7, and Windows with .NET Framework 4.8.
-The build obtains Framework reference assemblies through NuGet. `global.json`
-allows the latest installed .NET 10 feature band. Use an IDE/MSBuild version
-that supports `.slnx` if opening the solution in an IDE.
+Three things are needed, and none of them is built from source: the bridge
+NuGet package in your application, the server as a .NET tool, and one entry in
+your agent's MCP configuration. Releases are prereleases for now, so the
+commands say `--prerelease`.
 
-```powershell
-dotnet build WinFormsMcp.Instrumented.slnx -c Debug
+Prerequisites: Windows, a .NET Framework 4.8 WinForms application, and the
+.NET 10 SDK on the machine that runs the agent (`dotnet --list-sdks`).
+
+### 1. Add the bridge to your application
+
+Reference `WinFormsMcp.Instrumented` only in builds where you want it, so that
+shipping builds carry neither the package nor any bridge code. In the
+application's `.csproj` (use the latest version shown on nuget.org):
+
+```xml
+<PropertyGroup>
+  <!-- On for Debug, off for everything else, unless the caller sets it. -->
+  <EnableWinFormsMcpInstrumentation
+    Condition="'$(EnableWinFormsMcpInstrumentation)' == '' and '$(Configuration)' == 'Debug'">true</EnableWinFormsMcpInstrumentation>
+  <EnableWinFormsMcpInstrumentation
+    Condition="'$(EnableWinFormsMcpInstrumentation)' == ''">false</EnableWinFormsMcpInstrumentation>
+  <DefineConstants
+    Condition="'$(EnableWinFormsMcpInstrumentation)' == 'true'">$(DefineConstants);WINFORMS_MCP_INSTRUMENTED</DefineConstants>
+</PropertyGroup>
+<ItemGroup Condition="'$(EnableWinFormsMcpInstrumentation)' == 'true'">
+  <PackageReference Include="WinFormsMcp.Instrumented" Version="0.1.0-alpha.5" />
+</ItemGroup>
 ```
 
-The complete workflow (all tests, stripping checks, packing, and a restore of the
-packed packages) is `./eng/build.ps1`; add `-DesktopExercise` on an interactive
-desktop to also drive the demo through the real MCP server and capture the
-screen. If PowerShell reports that the script "is not digitally signed", the
-files carry a Mark-of-the-Web from an archive download; see
-[Windows host notes](docs/06-build-and-distribution.md#windows-host-notes-found-by-running-the-workflow).
+Restore and build must see the same value of the property; the
+[integration guide](docs/05-integration-and-stripping.md) explains why and how
+the stripping is verified. Then start the bridge in the existing STA `Main`,
+before `Application.Run`:
 
-The default Debug sample includes the bridge. Running its executable normally
-does not open an endpoint; the server supplies activation settings when it
-launches the app.
+```csharp
+#if WINFORMS_MCP_INSTRUMENTED
+using (WinFormsMcp.Instrumented.McpBridge.Start())
+{
+    Application.Run(new MainForm());
+}
+#else
+Application.Run(new MainForm());
+#endif
+```
 
-Example MCP client configuration, using the built server directly:
+The bridge stays inert until the server launches the application and hands it a
+private pipe name and token; running the executable normally opens no endpoint.
+[Customize the bridge](#integrate-an-application) for exclusions, limits, custom
+actions and adapters for third-party controls and grids.
+
+### 2. Install the server
+
+```powershell
+dotnet tool install --global WinFormsMcp.Instrumented.Server --prerelease
+winforms-mcp-instrumented --help
+```
+
+To pin the version for a whole team instead, install it as a local tool: run
+`dotnet new tool-manifest` and `dotnet tool install WinFormsMcp.Instrumented.Server --prerelease`
+in the repository root, commit `.config/dotnet-tools.json`, and start the server
+with `dotnet tool run winforms-mcp-instrumented -- <arguments>` from that
+directory.
+
+### 3. Register the server with your agent
+
+The server is a stdio MCP server. Give it the **absolute path of your
+instrumented build** with `--app`; it does not start the application until the
+agent calls `app_launch`, and it keeps running while the application closes or
+restarts. No token goes into the configuration.
+
+**Claude Code**
+
+```powershell
+claude mcp add --transport stdio winforms-instrumented -- winforms-mcp-instrumented --app "C:\src\MyApp\bin\Debug\net48\MyApp.exe"
+```
+
+The `--` separates Claude Code's own options from the server command. The
+default scope is private to you in the current project; `--scope user` makes it
+available in all projects, and `--scope project` writes a `.mcp.json` that is
+meant to be committed (the path is machine-specific, so share it only if
+everyone builds to the same location). The same entry in `.mcp.json`:
 
 ```json
 {
   "mcpServers": {
     "winforms-instrumented": {
-      "command": "dotnet",
-      "args": [
-        "C:\\src\\winforms-mcp-instrumented\\src\\WinFormsMcp.Instrumented.Server\\bin\\Debug\\net10.0\\WinFormsMcp.Instrumented.Server.dll",
-        "--app",
-        "C:\\src\\winforms-mcp-instrumented\\samples\\InstrumentedDemo\\bin\\Debug\\net48\\InstrumentedDemo.exe"
-      ]
+      "type": "stdio",
+      "command": "winforms-mcp-instrumented",
+      "args": ["--app", "C:\\src\\MyApp\\bin\\Debug\\net48\\MyApp.exe"]
     }
   }
 }
 ```
 
-Adjust the paths and your client's configuration envelope. The server starts
-immediately; `app_launch` starts the configured application. `app_status` remains
-available even while the app is stopped. No pipe token needs to be committed to
-the MCP configuration in launch mode.
+Check it with `claude mcp list`, or `/mcp` inside Claude Code.
 
-For a first exercise, ask the agent to:
+**Codex**
 
-1. Call `app_launch`, then `control_tree`.
-2. Find `txtName`, call `set_text`, and wait for its action receipt to complete.
-3. Invoke `btnGreet`, inspect `lblStatus`, and take a capture.
-4. Invoke `btnOpenDialog`; inspect the new window while the opening receipt is
-   `started`; invoke `btnCloseDialog`; confirm the opening action completes.
-5. Select the Dynamic identity tab. Observe `txtDynamic`, replace it, and confirm
-   that its old ID fails. Recreate its native handle and confirm the new managed
-   object's ID stays stable.
+```powershell
+codex mcp add winforms-instrumented -- winforms-mcp-instrumented --app "C:\src\MyApp\bin\Debug\net48\MyApp.exe"
+```
+
+or in `~/.codex/config.toml` (single quotes make a TOML literal string, so the
+backslashes need no escaping):
+
+```toml
+[mcp_servers.winforms-instrumented]
+command = "winforms-mcp-instrumented"
+args = ["--app", 'C:\src\MyApp\bin\Debug\net48\MyApp.exe']
+```
+
+Check it with `codex mcp list`.
+
+**Other MCP clients** take the same two pieces: the command
+`winforms-mcp-instrumented` and the arguments `--app <path>`.
+
+Good to know:
+
+- If the client cannot find the command, restart it after the install (the tool
+  directory was added to `PATH`), or use the full path of the shim,
+  `%USERPROFILE%\.dotnet\tools\winforms-mcp-instrumented.exe`.
+- Arguments after `--` are passed to your application, for example
+  `--app "C:\...\MyApp.exe" -- "C:\data\sample.proj"`. `--working-directory <dir>`
+  sets its working directory.
+- The executable must be a build that includes the bridge. A shipping build
+  starts, but every call answers `app_unavailable`.
+
+### 4. First run
+
+Ask the agent to call `app_launch`, then `control_tree`, and to describe what it
+sees. From there the [tool reference](docs/08-mcp-tools.md) lists every tool with
+its arguments, and `app_status` works even while the application is stopped. To
+see a complete walkthrough on a known application, use the demo in
+[Building from source](#building-from-source).
 
 ## Integrate an application
 
-The app references only `WinFormsMcp.Instrumented`. The server is installed or
-run separately. The startup hook is deliberately small:
+Options for the startup hook of [step 1](#1-add-the-bridge-to-your-application).
+The app references only `WinFormsMcp.Instrumented`; the server is installed
+separately. The hook is deliberately small:
 
 ```csharp
 // Inside the existing STA Main, after normal WinForms initialization:
@@ -238,12 +322,73 @@ companion types are public API, and `McpBridgeBuilder.AddAction` reserves the
 action names `open` and `close`: a consumer of `0.1.0-alpha.x` that registered a
 custom action with one of those names must rename it.
 
-The grid work (planned for `0.1.0-alpha.4`, not yet published) makes `GridAdapter`
+Since `0.1.0-alpha.4` (published) the grid work makes `GridAdapter`
 and its companion types public API, adds the `AddAction(name, accepts, callback)`
 overload, reserves `datagridview` as a grid-adapter name (an application adapter
 cannot use it), and brings the sidecar to **20 tools** (`set_grid_cell` is new;
 `select_control` and `scroll_control` gain an optional `viewToken`). The bridge
 protocol stays at version 1: every change is additive.
+
+Install the published tool as described in [Getting started](#getting-started);
+to try a locally built one, see [Building from source](#building-from-source).
+
+## Building from source
+
+Only needed to work on this repository or to run the demo; to use the packages,
+follow [Getting started](#getting-started).
+
+Prerequisites: a .NET 10 SDK, PowerShell 7, and Windows with .NET Framework 4.8.
+The build obtains Framework reference assemblies through NuGet. `global.json`
+allows the latest installed .NET 10 feature band. Use an IDE/MSBuild version
+that supports `.slnx` if opening the solution in an IDE.
+
+```powershell
+dotnet build WinFormsMcp.Instrumented.slnx -c Debug
+```
+
+The complete workflow (all tests, stripping checks, packing, and a restore of the
+packed packages) is `./eng/build.ps1`; add `-DesktopExercise` on an interactive
+desktop to also drive the demo through the real MCP server and capture the
+screen. If PowerShell reports that the script "is not digitally signed", the
+files carry a Mark-of-the-Web from an archive download; see
+[Windows host notes](docs/06-build-and-distribution.md#windows-host-notes-found-by-running-the-workflow).
+
+The default Debug sample includes the bridge. Running its executable normally
+does not open an endpoint; the server supplies activation settings when it
+launches the app.
+
+Example MCP client configuration, using the built server directly:
+
+```json
+{
+  "mcpServers": {
+    "winforms-instrumented": {
+      "command": "dotnet",
+      "args": [
+        "C:\\src\\winforms-mcp-instrumented\\src\\WinFormsMcp.Instrumented.Server\\bin\\Debug\\net10.0\\WinFormsMcp.Instrumented.Server.dll",
+        "--app",
+        "C:\\src\\winforms-mcp-instrumented\\samples\\InstrumentedDemo\\bin\\Debug\\net48\\InstrumentedDemo.exe"
+      ]
+    }
+  }
+}
+```
+
+Adjust the paths and your client's configuration envelope. The server starts
+immediately; `app_launch` starts the configured application. `app_status` remains
+available even while the app is stopped. No pipe token needs to be committed to
+the MCP configuration in launch mode.
+
+For a first exercise, ask the agent to:
+
+1. Call `app_launch`, then `control_tree`.
+2. Find `txtName`, call `set_text`, and wait for its action receipt to complete.
+3. Invoke `btnGreet`, inspect `lblStatus`, and take a capture.
+4. Invoke `btnOpenDialog`; inspect the new window while the opening receipt is
+   `started`; invoke `btnCloseDialog`; confirm the opening action completes.
+5. Select the Dynamic identity tab. Observe `txtDynamic`, replace it, and confirm
+   that its old ID fails. Recreate its native handle and confirm the new managed
+   object's ID stays stable.
 
 `eng/build.ps1` writes local packages under `artifacts/packages`. After building:
 
