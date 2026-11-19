@@ -45,7 +45,8 @@ from the consuming application's shipping build.
   view, select and scroll, and cell editing through the grid's own editor
   (`set_grid_cell`: a completed receipt means committed, a refused edit is a
   failed receipt). The adapter for a given grid suite is written in the
-  application, not in this repository.
+  application, not shipped as a package; [source examples for DevExpress](examples/devexpress/README.md)
+  (grid and bars) show one way to write it.
 - Dynamic creation, replacement, disposal, and reparenting observed on the next
   request. Native handle recreation preserves managed control identity.
 - Queued action receipts, so a modal dialog can be inspected and closed while
@@ -415,6 +416,7 @@ for details and source-archive behavior. Publishing is a separate step.
 | [Tool reference](docs/08-mcp-tools.md) | MCP tool arguments and common workflows |
 | [Element adapters](docs/09-element-adapters.md) | Menus, toolbars and third-party elements: seam, identity, measured limits |
 | [Grid adapters](docs/10-grid-adapters.md) | Reading, selecting and editing third-party grids: seam, freshness token, edit semantics, limits |
+| [DevExpress examples](examples/devexpress/README.md) | Source of a grid adapter and a bars adapter to copy into an application (not part of the packages) |
 | [Architecture decisions](docs/adr/) | Decision records and consequences |
 
 Coding agents should read [AGENTS.md](AGENTS.md). Claude Code guidance is in
